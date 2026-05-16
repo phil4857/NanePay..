@@ -1,10 +1,17 @@
-nanepay-backend/
+NanePay/
+│
+├── migrations/
+│   └── 001_initial_schema.js
+│
 ├── src/
+│   ├── app.js
 │   ├── config/
 │   ├── middleware/
 │   ├── routes/
 │   ├── services/
 │   └── utils/
-├── migrations/
+│
 ├── .env.example
-└── package.json
+├── .gitignore
+├── knexfile.js
+├── package.json
