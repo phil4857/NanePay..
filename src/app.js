@@ -11,7 +11,11 @@ const app = express()
 app.set('trust proxy', 1)
 app.use(helmet())
 app.use(cors({
-  origin:      process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: [
+    'https://nane-pay-avya.vercel.app',
+    process.env.FRONTEND_URL,
+    'http://localhost:3000',
+  ],
   credentials: true,
   methods:     ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }))
@@ -21,7 +25,12 @@ app.use(morgan('combined', { stream: { write: (msg) => logger.info(msg.trim()) }
 app.use('/api', apiLimiter)
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'NanePay API', version: '1.0.0', time: new Date().toISOString() })
+  res.json({
+    status:  'ok',
+    service: 'NanePay API',
+    version: '1.0.0',
+    time:    new Date().toISOString(),
+  })
 })
 
 app.use('/api/auth',         require('./routes/auth'))
@@ -33,7 +42,9 @@ app.use('/api/invest',       require('./routes/invest'))
 app.use('/api/merchant',     require('./routes/merchant'))
 app.use('/api/admin',        require('./routes/admin'))
 
-app.use((req, res) => res.status(404).json({ error: `Route ${req.method} ${req.path} not found` }))
+app.use((req, res) => {
+  res.status(404).json({ error: `Route ${req.method} ${req.path} not found` })
+})
 
 app.use((err, req, res, next) => {
   logger.error('Unhandled error', { err: err.message, path: req.path })
