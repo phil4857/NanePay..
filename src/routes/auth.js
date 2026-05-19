@@ -26,9 +26,8 @@ router.post('/register',
         return res.status(409).json({ error: `${field} already registered` })
       }
 
-      const hashed = await bcrypt.hash(
-        password, parseInt(process.env.BCRYPT_ROUNDS || '12')
-      )
+      const rounds = parseInt(process.env.BCRYPT_ROUNDS || '12')
+      const hashed = await bcrypt.hash(password, rounds)
 
       const { user, wallet } = await db.transaction(async (trx) => {
         const [user] = await trx('users').insert({
@@ -59,10 +58,26 @@ router.post('/register',
 
       logger.info('New user registered', { userId: user.id })
 
-      res.status(201).json({ message: 'Account created successfully', token, user, wallet })
+      res.status(201).json({
+        message: 'Account created successfully',
+        token,
+        user,
+        wallet,
+      })
     } catch (err) {
-      logger.error('Registration failed', { err: err.message })
-      res.status(500).json({ error: 'Registration failed. Please try again.' })
+      logger.error('Registration failed', { err: err.message, stack: err.stack })
+
+      if (err.code === '23505') {
+        return res.status(409).json({ error: 'Email or phone already registered' })
+      }
+      if (err.message.includes('JWT')) {
+        return res.status(500).json({ error: 'Server configuration error. Contact support.' })
+      }
+
+      res.status(500).json({
+        error:  'Registration failed. Please try again.',
+        reason: err.message,
+      })
     }
   }
 )
@@ -101,12 +116,24 @@ router.post('/login',
       res.json({
         message: 'Login successful',
         token,
-        user:   { id: user.id, name: user.name, email: user.email, phone: user.phone, role: user.role },
-        wallet: { balance: parseFloat(wallet.balance), currency: wallet.currency },
+        user: {
+          id:    user.id,
+          name:  user.name,
+          email: user.email,
+          phone: user.phone,
+          role:  user.role,
+        },
+        wallet: {
+          balance:  parseFloat(wallet.balance),
+          currency: wallet.currency,
+        },
       })
     } catch (err) {
       logger.error('Login failed', { err: err.message })
-      res.status(500).json({ error: 'Login failed. Please try again.' })
+      res.status(500).json({
+        error:  'Login failed. Please try again.',
+        reason: err.message,
+      })
     }
   }
 )
