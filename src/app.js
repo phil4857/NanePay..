@@ -17,7 +17,7 @@ app.use(cors({
     'http://localhost:3000',
   ],
   credentials: true,
-  methods:     ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }))
 app.use(express.json({ limit: '10kb' }))
 app.use(express.urlencoded({ extended: true }))
@@ -25,28 +25,28 @@ app.use(morgan('combined', { stream: { write: (msg) => logger.info(msg.trim()) }
 app.use('/api', apiLimiter)
 
 app.get('/health', (req, res) => {
-  res.json({
-    status:  'ok',
-    service: 'NanePay API',
-    version: '1.0.0',
-    time:    new Date().toISOString(),
-  })
+  res.json({ status: 'ok', service: 'NanePay API', version: '2.0.0', time: new Date().toISOString() })
 })
 
-app.use('/api/auth',         require('./routes/auth'))
-app.use('/api/wallet',       require('./routes/wallet'))
-app.use('/api/transactions', require('./routes/transactions'))
-app.use('/api/mpesa',        require('./routes/mpesa'))
-app.use('/api/forex',        require('./routes/forex'))
-app.use('/api/invest',       require('./routes/invest'))
-app.use('/api/merchant',     require('./routes/merchant'))
-app.use('/api/admin',        require('./routes/admin'))
-app.use('/api/bills',        require('./routes/bills'))
+// ── ROUTES ────────────────────────────────────────────────────
+app.use('/api/auth',          require('./routes/auth'))
+app.use('/api/auth',          require('./routes/passwords'))
+app.use('/api/wallet',        require('./routes/wallet'))
+app.use('/api/transactions',  require('./routes/transactions'))
+app.use('/api/mpesa',         require('./routes/mpesa'))
+app.use('/api/forex',         require('./routes/forex'))
+app.use('/api/invest',        require('./routes/invest'))
+app.use('/api/merchant',      require('./routes/merchant'))
+app.use('/api/bills',         require('./routes/bills'))
+app.use('/api/packages',      require('./routes/packages'))
+app.use('/api/subscriptions', require('./routes/subscriptions'))
+app.use('/api/mikrotik',      require('./routes/mikrotik'))
+app.use('/api/notifications', require('./routes/notifications'))
+app.use('/api/qr',            require('./routes/qr'))
+app.use('/api/request',       require('./routes/request'))
+app.use('/api/admin',         require('./routes/admin'))
 
-app.use((req, res) => {
-  res.status(404).json({ error: `Route ${req.method} ${req.path} not found` })
-})
-
+app.use((req, res) => res.status(404).json({ error: `Route ${req.method} ${req.path} not found` }))
 app.use((err, req, res, next) => {
   logger.error('Unhandled error', { err: err.message, path: req.path })
   res.status(500).json({ error: 'Something went wrong. Please try again.' })
@@ -54,7 +54,7 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 5000
 app.listen(PORT, () => {
-  logger.info(`🚀 NanePay API running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`)
+  logger.info(`🚀 NanePay API v2.0 running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`)
 })
 
 module.exports = app
