@@ -28,7 +28,7 @@ exports.up = async function (knex) {
     t.decimal('amount', 15, 2).notNullable()
     t.decimal('fee', 15, 2).defaultTo(0.00)
     t.decimal('net_amount', 15, 2).notNullable()
-    t.enum('type', ['TRANSFER','MPESA_DEPOSIT','MPESA_WITHDRAW','FOREX_BUY','FOREX_SELL','INVESTMENT_IN','INVESTMENT_OUT','MERCHANT_PAYMENT','FEE','REVERSAL']).notNullable()
+    t.enum('type', ['TRANSFER','MPESA_DEPOSIT','MPESA_WITHDRAW','FOREX_BUY','FOREX_SELL','INVESTMENT_IN','INVESTMENT_OUT','MERCHANT_PAYMENT','BILL_PAYMENT','FEE','REVERSAL']).notNullable()
     t.enum('status', ['PENDING','SUCCESSFUL','FAILED','REVERSED']).defaultTo('PENDING')
     t.string('reference', 50).unique().notNullable()
     t.text('description').nullable()
@@ -36,6 +36,7 @@ exports.up = async function (knex) {
     t.string('mpesa_reference', 50).nullable()
     t.decimal('forex_rate', 15, 6).nullable()
     t.string('forex_currency', 5).nullable()
+    t.jsonb('metadata').nullable()
     t.timestamp('created_at').defaultTo(knex.fn.now())
   })
 
