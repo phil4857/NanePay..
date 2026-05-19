@@ -41,6 +41,7 @@ app.use('/api/forex',        require('./routes/forex'))
 app.use('/api/invest',       require('./routes/invest'))
 app.use('/api/merchant',     require('./routes/merchant'))
 app.use('/api/admin',        require('./routes/admin'))
+app.use('/api/bills',        require('./routes/bills'))
 
 app.use((req, res) => {
   res.status(404).json({ error: `Route ${req.method} ${req.path} not found` })
