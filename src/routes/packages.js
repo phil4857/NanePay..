@@ -5,7 +5,7 @@ const { authenticate, requireActive } = require('../middleware/auth')
 
 const router = express.Router()
 
-// ── GET /api/packages — public marketplace ────────────────────
+// ── GET /api/packages ─────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
     const { category, merchant_id } = req.query
@@ -49,7 +49,7 @@ router.get('/:id', async (req, res) => {
   }
 })
 
-// ── POST /api/packages — merchant creates package ─────────────
+// ── POST /api/packages ────────────────────────────────────────
 router.post('/', authenticate, requireActive, async (req, res) => {
   const userId = req.user.userId
   const {
@@ -59,22 +59,29 @@ router.post('/', authenticate, requireActive, async (req, res) => {
   } = req.body
 
   if (!name || !duration_type || !duration_value || !price) {
-    return res.status(400).json({ error: 'name, duration_type, duration_value and price are required' })
+    return res.status(400).json({
+      error: 'name, duration_type, duration_value and price are required',
+    })
   }
 
   try {
-    const merchant = await db('merchant_profiles').where({ user_id: userId }).first()
-    if (!merchant) return res.status(403).json({ error: 'Merchant profile required' })
+    const merchant = await db('merchant_profiles')
+      .where({ user_id: userId })
+      .first()
+
+    if (!merchant) {
+      return res.status(403).json({ error: 'Merchant profile required' })
+    }
 
     const [pkg] = await db('packages').insert({
       merchant_id:    merchant.id,
       name:           name.trim(),
-      description:    description?.trim() || null,
+      description:    description ? description.trim() : null,
       category:       (category || 'WIFI').toUpperCase(),
       duration_type:  duration_type.toUpperCase(),
       duration_value: parseInt(duration_value),
       price:          parseFloat(price),
-      speed_profile:  speed_profile?.trim() || null,
+      speed_profile:  speed_profile ? speed_profile.trim() : null,
       device_limit:   parseInt(device_limit || 1),
       is_active:      true,
       created_at:     new Date(),
@@ -90,32 +97,32 @@ router.post('/', authenticate, requireActive, async (req, res) => {
 // ── PATCH /api/packages/:id ───────────────────────────────────
 router.patch('/:id', authenticate, requireActive, async (req, res) => {
   const userId = req.user.userId
+
   try {
-    hi merchant = await db('merchant_profiles').where({ user_id: userId }).first()
-    if (!merchant) return res.status(403).json({ error: 'Merchant profile required' })
+    const merchant = await db('merchant_profiles')
+      .where({ user_id: userId })
+      .first()
+
+    if (!merchant) {
+      return res.status(403).json({ error: 'Merchant profile required' })
+    }
 
     const pkg = await db('packages')
       .where({ id: req.params.id, merchant_id: merchant.id })
       .first()
-    if (!pkg) return res.status(404).json({ error: 'Package not found' })
 
-     router.patch('/:id', authenticate, requireActive, async (req, res) => {
-  const userId = req.user.userId
-  try {
-    const merchant = await db('merchant_profiles').where({ user_id: userId }).first()
-    if (!merchant) return res.status(403).json({ error: 'Merchant profile required' })
-
-    const pkg = await db('packages')
-      .where({ id: req.params.id, merchant_id: merchant.id })
-      .first()
-    if (!pkg) return res.status(404).json({ error: 'Package not found' })
+    if (!pkg) {
+      return res.status(404).json({ error: 'Package not found' })
+    }
 
     const allowed = ['name', 'description', 'price', 'speed_profile', 'device_limit', 'is_active']
-    const updates = Object.fromEntries(
-      allowed
-        .filter(k => req.body[k] !== undefined)
-        .map(k => [k, req.body[k]])
-    )
+    const updates = {}
+
+    allowed.forEach(function(k) {
+      if (req.body[k] !== undefined) {
+        updates[k] = req.body[k]
+      }
+    })
 
     if (Object.keys(updates).length === 0) {
       return res.status(400).json({ error: 'No valid fields to update' })
@@ -133,14 +140,34 @@ router.patch('/:id', authenticate, requireActive, async (req, res) => {
   }
 })
 
-    const [updated] = await db('packages')
-      .where({ id: pkg.id })
-      .update(updates)
-      .returning('*')
+// ── DELETE /api/packages/:id ──────────────────────────────────
+router.delete('/:id', authenticate, requireActive, async (req, res) => {
+  const userId = req.user.userId
 
-    res.json({ message: 'Package updated', package: updated })
+  try {
+    const merchant = await db('merchant_profiles')
+      .where({ user_id: userId })
+      .first()
+
+    if (!merchant) {
+      return res.status(403).json({ error: 'Merchant profile required' })
+    }
+
+    const pkg = await db('packages')
+      .where({ id: req.params.id, merchant_id: merchant.id })
+      .first()
+
+    if (!pkg) {
+      return res.status(404).json({ error: 'Package not found' })
+    }
+
+    await db('packages')
+      .where({ id: pkg.id })
+      .update({ is_active: false })
+
+    res.json({ message: 'Package deactivated' })
   } catch (err) {
-    res.status(500).json({ error: 'Failed to update package' })
+    res.status(500).json({ error: 'Failed to deactivate package' })
   }
 })
 
