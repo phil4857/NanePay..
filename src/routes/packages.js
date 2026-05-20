@@ -12,12 +12,13 @@ router.get('/', async (req, res) => {
 
     let query = db('packages as p')
       .join('merchant_profiles as m', 'p.merchant_id', 'm.id')
-      .join('users as u', 'm.user_id', 'u.id')
-      .where({ 'p.is_active': true, 'm.status': 'APPROVED' })
+      .where({ 'p.is_active': true })
       .select(
         'p.*',
-        'm.business_name', 'm.business_logo', 'm.avg_rating',
-        'm.slug as merchant_slug',
+        'm.business_name',
+        'm.business_logo',
+        'm.avg_rating',
+        'm.slug as merchant_slug'
       )
       .orderBy('p.price', 'asc')
 
@@ -38,7 +39,7 @@ router.get('/:id', async (req, res) => {
     const pkg = await db('packages as p')
       .join('merchant_profiles as m', 'p.merchant_id', 'm.id')
       .where({ 'p.id': req.params.id })
-      .select('p.*', 'm.business_name', 'm.business_logo', 'm.avg_rating', 'm.slug as merchant_slug')
+      .select('p.*', 'm.business_name', 'm.slug as merchant_slug')
       .first()
 
     if (!pkg) return res.status(404).json({ error: 'Package not found' })
@@ -51,7 +52,11 @@ router.get('/:id', async (req, res) => {
 // ── POST /api/packages — merchant creates package ─────────────
 router.post('/', authenticate, requireActive, async (req, res) => {
   const userId = req.user.userId
-  const { name, description, category, duration_type, duration_value, price, speed_profile, device_limit } = req.body
+  const {
+    name, description, category,
+    duration_type, duration_value,
+    price, speed_profile, device_limit,
+  } = req.body
 
   if (!name || !duration_type || !duration_value || !price) {
     return res.status(400).json({ error: 'name, duration_type, duration_value and price are required' })
@@ -64,12 +69,12 @@ router.post('/', authenticate, requireActive, async (req, res) => {
     const [pkg] = await db('packages').insert({
       merchant_id:    merchant.id,
       name:           name.trim(),
-      description:    description?.trim(),
+      description:    description?.trim() || null,
       category:       (category || 'WIFI').toUpperCase(),
       duration_type:  duration_type.toUpperCase(),
       duration_value: parseInt(duration_value),
       price:          parseFloat(price),
-      speed_profile:  speed_profile?.trim(),
+      speed_profile:  speed_profile?.trim() || null,
       device_limit:   parseInt(device_limit || 1),
       is_active:      true,
       created_at:     new Date(),
@@ -86,17 +91,53 @@ router.post('/', authenticate, requireActive, async (req, res) => {
 router.patch('/:id', authenticate, requireActive, async (req, res) => {
   const userId = req.user.userId
   try {
+    hi merchant = await db('merchant_profiles').where({ user_id: userId }).first()
+    if (!merchant) return res.status(403).json({ error: 'Merchant profile required' })
+
+    const pkg = await db('packages')
+      .where({ id: req.params.id, merchant_id: merchant.id })
+      .first()
+    if (!pkg) return res.status(404).json({ error: 'Package not found' })
+
+     router.patch('/:id', authenticate, requireActive, async (req, res) => {
+  const userId = req.user.userId
+  try {
     const merchant = await db('merchant_profiles').where({ user_id: userId }).first()
     if (!merchant) return res.status(403).json({ error: 'Merchant profile required' })
 
-    const pkg = await db('packages').where({ id: req.params.id, merchant_id: merchant.id }).first()
+    const pkg = await db('packages')
+      .where({ id: req.params.id, merchant_id: merchant.id })
+      .first()
     if (!pkg) return res.status(404).json({ error: 'Package not found' })
 
     const allowed = ['name', 'description', 'price', 'speed_profile', 'device_limit', 'is_active']
-    const updates: any = {}
-    allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k] })
+    const updates = Object.fromEntries(
+      allowed
+        .filter(k => req.body[k] !== undefined)
+        .map(k => [k, req.body[k]])
+    )
 
-    const [updated] = await db('packages').where({ id: pkg.id }).update(updates).returning('*')
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' })
+    }
+
+    const [updated] = await db('packages')
+      .where({ id: pkg.id })
+      .update(updates)
+      .returning('*')
+
+    res.json({ message: 'Package updated', package: updated })
+  } catch (err) {
+    logger.error('Update package failed', { err: err.message })
+    res.status(500).json({ error: 'Failed to update package' })
+  }
+})
+
+    const [updated] = await db('packages')
+      .where({ id: pkg.id })
+      .update(updates)
+      .returning('*')
+
     res.json({ message: 'Package updated', package: updated })
   } catch (err) {
     res.status(500).json({ error: 'Failed to update package' })
