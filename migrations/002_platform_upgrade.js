@@ -1,9 +1,8 @@
 exports.up = async function (knex) {
-
-  // ── PACKAGES ──────────────────────────────────────────────
+  // ── PACKAGES ────────────────────────────────────────────────
   await knex.schema.createTable('packages', (t) => {
     t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'))
-    t.uuid('merchant_id').references('id').inTable('merchant_profiles').onDelete('CASCADE')
+    t.uuid('merchant_id').nullable().references('id').inTable('merchant_profiles').onDelete('CASCADE')
     t.string('name', 100).notNullable()
     t.text('description').nullable()
     t.enum('category', ['WIFI', 'ELECTRICITY', 'WATER', 'SCHOOL', 'RENT', 'CUSTOM']).defaultTo('WIFI')
@@ -17,7 +16,7 @@ exports.up = async function (knex) {
     t.timestamp('created_at').defaultTo(knex.fn.now())
   })
 
-  // ── SUBSCRIPTIONS ─────────────────────────────────────────
+  // ── SUBSCRIPTIONS ────────────────────────────────────────────
   await knex.schema.createTable('subscriptions', (t) => {
     t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'))
     t.uuid('user_id').notNullable().references('id').inTable('users').onDelete('CASCADE')
@@ -33,7 +32,7 @@ exports.up = async function (knex) {
     t.timestamp('created_at').defaultTo(knex.fn.now())
   })
 
-  // ── HOTSPOT SESSIONS ──────────────────────────────────────
+  // ── HOTSPOT SESSIONS ─────────────────────────────────────────
   await knex.schema.createTable('hotspot_sessions', (t) => {
     t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'))
     t.uuid('subscription_id').notNullable().references('id').inTable('subscriptions')
@@ -48,7 +47,7 @@ exports.up = async function (knex) {
     t.timestamp('ended_at').nullable()
   })
 
-  // ── ROUTERS ───────────────────────────────────────────────
+  // ── ROUTERS ──────────────────────────────────────────────────
   await knex.schema.createTable('routers', (t) => {
     t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'))
     t.uuid('merchant_id').notNullable().references('id').inTable('merchant_profiles').onDelete('CASCADE')
@@ -59,14 +58,14 @@ exports.up = async function (knex) {
     t.string('username', 100).nullable()
     t.string('password_encrypted', 255).nullable()
     t.string('api_endpoint', 255).nullable()
-    t.string('api_key', 255).nullable()
+    t.string('api_key_router', 255).nullable()
     t.boolean('is_online').defaultTo(false)
     t.timestamp('last_seen').nullable()
     t.jsonb('config').nullable()
     t.timestamp('created_at').defaultTo(knex.fn.now())
   })
 
-  // ── WITHDRAWALS ───────────────────────────────────────────
+  // ── WITHDRAWALS ──────────────────────────────────────────────
   await knex.schema.createTable('withdrawals', (t) => {
     t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'))
     t.uuid('user_id').notNullable().references('id').inTable('users').onDelete('CASCADE')
@@ -82,7 +81,7 @@ exports.up = async function (knex) {
     t.timestamp('completed_at').nullable()
   })
 
-  // ── NOTIFICATIONS ─────────────────────────────────────────
+  // ── NOTIFICATIONS ─────────────────────────────────────────────
   await knex.schema.createTable('notifications', (t) => {
     t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'))
     t.uuid('user_id').notNullable().references('id').inTable('users').onDelete('CASCADE')
@@ -94,7 +93,7 @@ exports.up = async function (knex) {
     t.timestamp('created_at').defaultTo(knex.fn.now())
   })
 
-  // ── COMMISSIONS ───────────────────────────────────────────
+  // ── COMMISSIONS ───────────────────────────────────────────────
   await knex.schema.createTable('commissions', (t) => {
     t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'))
     t.uuid('merchant_id').notNullable().references('id').inTable('merchant_profiles').onDelete('CASCADE')
@@ -108,7 +107,7 @@ exports.up = async function (knex) {
     t.timestamp('created_at').defaultTo(knex.fn.now())
   })
 
-  // ── PASSWORD RESETS ───────────────────────────────────────
+  // ── PASSWORD RESETS ───────────────────────────────────────────
   await knex.schema.createTable('password_resets', (t) => {
     t.bigIncrements('id')
     t.uuid('user_id').notNullable().references('id').inTable('users').onDelete('CASCADE')
@@ -118,43 +117,66 @@ exports.up = async function (knex) {
     t.timestamp('created_at').defaultTo(knex.fn.now())
   })
 
-  // ── MERCHANT RATINGS ──────────────────────────────────────
+  // ── MERCHANT RATINGS ──────────────────────────────────────────
   await knex.schema.createTable('merchant_ratings', (t) => {
     t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'))
     t.uuid('merchant_id').notNullable().references('id').inTable('merchant_profiles').onDelete('CASCADE')
     t.uuid('user_id').notNullable().references('id').inTable('users').onDelete('CASCADE')
-    t.integer('rating').notNullable().checkBetween([1, 5])
+    t.integer('rating').notNullable()
     t.text('review').nullable()
     t.timestamp('created_at').defaultTo(knex.fn.now())
   })
 
-  // ── ADD COLUMNS TO EXISTING TABLES ────────────────────────
-  await knex.schema.alterTable('merchant_profiles', (t) => {
-    t.enum('status', ['PENDING', 'APPROVED', 'SUSPENDED', 'REJECTED']).defaultTo('PENDING')
-    t.text('rejection_reason').nullable()
-    t.decimal('wallet_balance', 15, 2).defaultTo(0)
-    t.string('business_logo', 500).nullable()
-    t.text('business_description').nullable()
-    t.string('website', 255).nullable()
-    t.decimal('avg_rating', 3, 2).defaultTo(0)
-    t.integer('total_ratings').defaultTo(0)
-  })
+  // ── ALTER EXISTING TABLES ─────────────────────────────────────
+  // Add columns to merchant_profiles safely
+  const hasMerchantStatus = await knex.schema.hasColumn('merchant_profiles', 'status')
+  if (!hasMerchantStatus) {
+    await knex.schema.alterTable('merchant_profiles', (t) => {
+      t.string('status', 20).defaultTo('PENDING')
+      t.text('rejection_reason').nullable()
+      t.decimal('wallet_balance', 15, 2).defaultTo(0)
+      t.string('business_logo', 500).nullable()
+      t.text('business_description').nullable()
+      t.string('website', 255).nullable()
+      t.decimal('avg_rating', 3, 2).defaultTo(0)
+      t.integer('total_ratings').defaultTo(0)
+    })
+  }
 
-  await knex.schema.alterTable('users', (t) => {
-    t.boolean('email_verified').defaultTo(false)
-    t.boolean('phone_verified').defaultTo(false)
-    t.string('avatar', 500).nullable()
-    t.string('notification_token', 500).nullable()
-  })
+  // Add columns to users safely
+  const hasEmailVerified = await knex.schema.hasColumn('users', 'email_verified')
+  if (!hasEmailVerified) {
+    await knex.schema.alterTable('users', (t) => {
+      t.boolean('email_verified').defaultTo(false)
+      t.boolean('phone_verified').defaultTo(false)
+      t.string('avatar', 500).nullable()
+    })
+  }
 
-  // ── INDEXES ───────────────────────────────────────────────
-  await knex.raw('CREATE INDEX idx_subs_user     ON subscriptions(user_id)')
-  await knex.raw('CREATE INDEX idx_subs_status   ON subscriptions(status)')
-  await knex.raw('CREATE INDEX idx_subs_expires  ON subscriptions(expires_at)')
-  await knex.raw('CREATE INDEX idx_notif_user    ON notifications(user_id)')
-  await knex.raw('CREATE INDEX idx_notif_read    ON notifications(is_read)')
-  await knex.raw('CREATE INDEX idx_sessions_sub  ON hotspot_sessions(subscription_id)')
-  await knex.raw('CREATE INDEX idx_withdraw_user ON withdrawals(user_id)')
+  // Add metadata to transactions if missing
+  const hasTxMeta = await knex.schema.hasColumn('transactions', 'metadata')
+  if (!hasTxMeta) {
+    await knex.schema.alterTable('transactions', (t) => {
+      t.jsonb('metadata').nullable()
+    })
+  }
+
+  // Add BILL_PAYMENT to transactions type if not already
+  // Note: PostgreSQL enum alteration — safe approach
+  try {
+    await knex.raw("ALTER TYPE transactions_type_enum ADD VALUE IF NOT EXISTS 'BILL_PAYMENT'")
+  } catch (e) {
+    // Enum value may already exist, ignore
+  }
+
+  // ── INDEXES ────────────────────────────────────────────────────
+  await knex.raw('CREATE INDEX IF NOT EXISTS idx_subs_user    ON subscriptions(user_id)')
+  await knex.raw('CREATE INDEX IF NOT EXISTS idx_subs_status  ON subscriptions(status)')
+  await knex.raw('CREATE INDEX IF NOT EXISTS idx_subs_expires ON subscriptions(expires_at)')
+  await knex.raw('CREATE INDEX IF NOT EXISTS idx_notif_user   ON notifications(user_id)')
+  await knex.raw('CREATE INDEX IF NOT EXISTS idx_notif_read   ON notifications(is_read)')
+  await knex.raw('CREATE INDEX IF NOT EXISTS idx_sessions_sub ON hotspot_sessions(subscription_id)')
+  await knex.raw('CREATE INDEX IF NOT EXISTS idx_withdraw_user ON withdrawals(user_id)')
 }
 
 exports.down = async function (knex) {
