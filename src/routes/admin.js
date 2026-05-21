@@ -1,287 +1,156 @@
+// src/routes/admin.js  ← NEW FILE
 const express = require('express')
-const db      = require('../config/database')
-const logger  = require('../config/logger')
-const { authenticate, requireAdmin } = require('../middleware/auth')
-const { auditLog }                   = require('../middleware/audit')
-const { paginate }                   = require('../utils/helpers')
+const { v4: uuid } = require('uuid')
+const db      = require('../db')
+const { authenticate, requireRole } = require('../middleware/auth')
 
 const router = express.Router()
-router.use(authenticate, requireAdmin)
+const adminOnly = [authenticate, requireRole('admin')]
 
-// ── GET /api/admin/stats ──────────────────────────────────────
-router.get('/stats', async (req, res) => {
-  try {
-    const [users]     = await db('users').count('id as count')
-    const [merchants] = await db('merchant_profiles').count('id as count')
-    const [txs]       = await db('transactions').where({ status: 'SUCCESSFUL' }).count('id as count')
-    const [revenue]   = await db('fee_ledger').sum('amount as total')
-    const [subs]      = await db('subscriptions').where({ status: 'ACTIVE' }).count('id as count')
+// ── GET /api/admin/dashboard ─────────────────────────────────────
+router.get('/dashboard', ...adminOnly, async (req, res) => {
+  const [
+    users, merchants, transactions, revenue,
+    pendingWithdrawals, activeSessions
+  ] = await Promise.all([
+    db('users').count('id as count').first(),
+    db('merchants').where({ status: 'approved' }).count('id as count').first(),
+    db('transactions').where({ status: 'completed' }).sum('amount as total').first(),
+    db('platform_revenue').sum('amount as total').first(),
+    db('withdrawals').where({ status: 'pending' }).count('id as count').first(),
+    db('wifi_sessions').where({ status: 'active' }).count('id as count').first(),
+  ])
 
-    const today = new Date()
-    today.setHours(0, 0, 0, 0)
-
-    const [today_txs]     = await db('transactions').where({ status: 'SUCCESSFUL' }).where('created_at', '>=', today).count('id as count')
-    const [today_revenue] = await db('fee_ledger').where('created_at', '>=', today).sum('amount as total')
-
-    res.json({
-      total_users:     parseInt(users.count),
-      total_merchants: parseInt(merchants.count),
-      total_txs:       parseInt(txs.count),
-      total_revenue:   parseFloat(revenue.total || 0),
-      active_subs:     parseInt(subs.count),
-      today_txs:       parseInt(today_txs.count),
-      today_revenue:   parseFloat(today_revenue.total || 0),
-    })
-  } catch (err) {
-    logger.error('Admin stats failed', { err: err.message })
-    res.status(500).json({ error: 'Failed to fetch stats' })
-  }
+  return res.json({
+    stats: {
+      totalUsers:          parseInt(users?.count || 0),
+      approvedMerchants:   parseInt(merchants?.count || 0),
+      totalTransactions:   parseFloat(transactions?.total || 0),
+      platformRevenue:     parseFloat(revenue?.total || 0),
+      pendingWithdrawals:  parseInt(pendingWithdrawals?.count || 0),
+      activeWifiSessions:  parseInt(activeSessions?.count || 0),
+    },
+  })
 })
 
-// ── GET /api/admin/users ──────────────────────────────────────
-router.get('/users', async (req, res) => {
-  const { page, limit, offset } = paginate(null, req.query.page, req.query.limit)
-  const { search, role } = req.query
-  try {
-    let query = db('users')
-      .select('id', 'name', 'email', 'phone', 'role', 'is_active', 'created_at')
-      .orderBy('created_at', 'desc')
-      .limit(limit)
-      .offset(offset)
+// ── GET /api/admin/users ─────────────────────────────────────────
+router.get('/users', ...adminOnly, async (req, res) => {
+  const { page = 1, limit = 30, search } = req.query
+  const offset = (parseInt(page) - 1) * parseInt(limit)
 
-    if (search) {
-      query = query.where(function () {
-        this.whereILike('name', `%${search}%`).orWhereILike('email', `%${search}%`)
+  let q = db('users').select('id', 'name', 'email', 'phone', 'role', 'is_active', 'is_banned', 'created_at')
+    .orderBy('created_at', 'desc').limit(parseInt(limit)).offset(offset)
+
+  if (search) q = q.where(b => b.where('name', 'ilike', `%${search}%`).orWhere('email', 'ilike', `%${search}%`))
+
+  const users = await q
+  return res.json({ users })
+})
+
+// ── POST /api/admin/users/:id/ban ────────────────────────────────
+router.post('/users/:id/ban', ...adminOnly, async (req, res) => {
+  await db('users').where({ id: req.params.id }).update({ is_banned: true, updated_at: new Date() })
+  await db('audit_logs').insert({
+    id: uuid(), actor_id: req.user.id, action: 'user_banned',
+    target_type: 'user', target_id: req.params.id,
+    description: req.body.reason || 'Banned by admin', created_at: new Date(),
+  })
+  return res.json({ message: 'User banned' })
+})
+
+// ── POST /api/admin/merchants/:id/approve ───────────────────────
+router.post('/merchants/:id/approve', ...adminOnly, async (req, res) => {
+  const merchant = await db('merchants').where({ id: req.params.id }).first()
+  if (!merchant) return res.status(404).json({ message: 'Not found' })
+
+  await db.transaction(async trx => {
+    await trx('merchants').where({ id: merchant.id }).update({ status: 'approved', updated_at: new Date() })
+
+    // Create merchant wallet if not exists
+    const existing = await trx('merchant_wallets').where({ merchant_id: merchant.id }).first()
+    if (!existing) {
+      await trx('merchant_wallets').insert({
+        id: uuid(), merchant_id: merchant.id,
+        balance: 0, total_earnings: 0, pending_withdrawal: 0, total_withdrawn: 0,
+        created_at: new Date(), updated_at: new Date(),
       })
     }
-    if (role) query = query.where({ role })
 
-    const [users, [{ total }]] = await Promise.all([
-      query,
-      db('users').count('id as total'),
-    ])
-
-    const enriched = await Promise.all(users.map(async (u) => {
-      const wallet = await db('wallets').where({ user_id: u.id }).select('balance').first()
-      return { ...u, balance: parseFloat(wallet?.balance || 0) }
-    }))
-
-    res.json({ users: enriched, pagination: { page, limit, total: parseInt(total) } })
-  } catch (err) {
-    logger.error('Admin get users failed', { err: err.message })
-    res.status(500).json({ error: 'Failed to fetch users' })
-  }
-})
-
-// ── PATCH /api/admin/users/:id/suspend ───────────────────────
-router.patch('/users/:id/suspend', async (req, res) => {
-  try {
-    const user = await db('users').where({ id: req.params.id }).first()
-    if (!user) return res.status(404).json({ error: 'User not found' })
-    if (user.role === 'admin') return res.status(400).json({ error: 'Cannot suspend an admin' })
-
-    const new_status = !user.is_active
-    await db('users').where({ id: req.params.id }).update({ is_active: new_status })
-    await auditLog(req, new_status ? 'USER_UNSUSPENDED' : 'USER_SUSPENDED', { target: req.params.id })
-
-    res.json({ message: `User ${new_status ? 'unsuspended' : 'suspended'}`, is_active: new_status })
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to update user' })
-  }
-})
-
-// ── GET /api/admin/merchants ──────────────────────────────────
-router.get('/merchants', async (req, res) => {
-  const { page, limit, offset } = paginate(null, req.query.page, req.query.limit)
-  const { status } = req.query
-  try {
-    let query = db('merchant_profiles as m')
-      .join('users as u', 'm.user_id', 'u.id')
-      .select('m.*', 'u.name', 'u.email', 'u.phone')
-      .orderBy('m.created_at', 'desc')
-      .limit(limit)
-      .offset(offset)
-
-    if (status) query = query.where({ 'm.status': status })
-
-    const merchants = await query
-    res.json({ merchants, pagination: { page, limit } })
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch merchants' })
-  }
-})
-
-// ── PATCH /api/admin/merchants/:id/approve ────────────────────
-router.patch('/merchants/:id/approve', async (req, res) => {
-  try {
-    const { action, reason } = req.body
-
-    if (!['approve', 'reject', 'suspend'].includes(action)) {
-      return res.status(400).json({ error: 'Invalid action. Use approve, reject or suspend.' })
-    }
-
-    const statusMap = {
-      approve: 'APPROVED',
-      reject:  'REJECTED',
-      suspend: 'SUSPENDED',
-    }
-
-    await db('merchant_profiles')
-      .where({ id: req.params.id })
-      .update({
-        status:           statusMap[action],
-        rejection_reason: reason || null,
-      })
-
-    await auditLog(req, `MERCHANT_${action.toUpperCase()}`, { merchant_id: req.params.id })
-    res.json({ message: `Merchant ${action}d successfully` })
-  } catch (err) {
-    logger.error('Merchant approve failed', { err: err.message })
-    res.status(500).json({ error: 'Failed to update merchant' })
-  }
-})
-
-// ── GET /api/admin/transactions ───────────────────────────────
-router.get('/transactions', async (req, res) => {
-  const { page, limit, offset } = paginate(null, req.query.page, req.query.limit)
-  const { type, status } = req.query
-  try {
-    let query = db('transactions')
-      .orderBy('created_at', 'desc')
-      .limit(limit)
-      .offset(offset)
-
-    if (type)   query = query.where({ type })
-    if (status) query = query.where({ status })
-
-    const [transactions, [{ total }]] = await Promise.all([
-      query,
-      db('transactions').count('id as total'),
-    ])
-
-    res.json({
-      transactions: transactions.map(t => ({
-        ...t,
-        amount: parseFloat(t.amount),
-        fee:    parseFloat(t.fee || 0),
-      })),
-      pagination: { page, limit, total: parseInt(total) },
-    })
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch transactions' })
-  }
-})
-
-// ── PATCH /api/admin/transactions/:id/reverse ─────────────────
-router.patch('/transactions/:id/reverse', async (req, res) => {
-  try {
-    const tx = await db('transactions').where({ id: req.params.id }).first()
-    if (!tx) return res.status(404).json({ error: 'Transaction not found' })
-    if (tx.status !== 'SUCCESSFUL') return res.status(400).json({ error: 'Only successful transactions can be reversed' })
-    if (tx.type !== 'TRANSFER')     return res.status(400).json({ error: 'Only transfers can be reversed' })
-
-    await db.transaction(async (trx) => {
-      await trx('transactions').where({ id: tx.id }).update({ status: 'REVERSED' })
-      if (tx.sender_id)   await trx('wallets').where({ user_id: tx.sender_id }).increment('balance', tx.amount)
-      if (tx.receiver_id) await trx('wallets').where({ user_id: tx.receiver_id }).decrement('balance', tx.net_amount)
-
-      await trx('transactions').insert({
-        sender_id:   tx.receiver_id,
-        receiver_id: tx.sender_id,
-        amount:      tx.amount,
-        fee:         0,
-        net_amount:  tx.amount,
-        type:        'REVERSAL',
-        status:      'SUCCESSFUL',
-        reference:   'REV-' + tx.reference,
-        description: `Reversal of ${tx.reference}`,
-        created_at:  new Date(),
-      })
+    await trx('notifications').insert({
+      id: uuid(), user_id: merchant.user_id,
+      title: '🎉 Merchant Account Approved',
+      body: 'Your merchant account has been approved. You can now create WiFi packages!',
+      type: 'success', created_at: new Date(), updated_at: new Date(),
     })
 
-    await auditLog(req, 'TRANSACTION_REVERSED', { tx_id: tx.id })
-    res.json({ message: 'Transaction reversed successfully' })
-  } catch (err) {
-    logger.error('Reversal failed', { err: err.message })
-    res.status(500).json({ error: 'Reversal failed' })
-  }
-})
-
-// ── GET /api/admin/withdrawals ────────────────────────────────
-router.get('/withdrawals', async (req, res) => {
-  const { page, limit, offset } = paginate(null, req.query.page, req.query.limit)
-  try {
-    const withdrawals = await db('withdrawals as w')
-      .join('users as u', 'w.user_id', 'u.id')
-      .select('w.*', 'u.name', 'u.phone as user_phone')
-      .orderBy('w.created_at', 'desc')
-      .limit(limit)
-      .offset(offset)
-
-    res.json({ withdrawals })
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch withdrawals' })
-  }
-})
-
-// ── GET /api/admin/subscriptions ──────────────────────────────
-router.get('/subscriptions', async (req, res) => {
-  const { page, limit, offset } = paginate(null, req.query.page, req.query.limit)
-  try {
-    const subs = await db('subscriptions as s')
-      .join('users as u',            's.user_id',     'u.id')
-      .join('packages as p',         's.package_id',  'p.id')
-      .join('merchant_profiles as m','s.merchant_id', 'm.id')
-      .select(
-        's.*',
-        'u.name as user_name',
-        'u.phone as user_phone',
-        'p.name as package_name',
-        'm.business_name',
-      )
-      .orderBy('s.created_at', 'desc')
-      .limit(limit)
-      .offset(offset)
-
-    res.json({ subscriptions: subs })
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch subscriptions' })
-  }
-})
-
-// ── GET /api/admin/reports/revenue ────────────────────────────
-router.get('/reports/revenue', async (req, res) => {
-  try {
-    const [transfer_fees] = await db('fee_ledger').where({ type: 'TRANSFER_FEE' }).sum('amount as total').count('id as count')
-    const [merchant_fees] = await db('fee_ledger').where({ type: 'MERCHANT_FEE' }).sum('amount as total').count('id as count')
-    const [forex_margin]  = await db('fee_ledger').where({ type: 'FOREX_MARGIN' }).sum('amount as total').count('id as count')
-    const [bill_fees]     = await db('fee_ledger').where({ type: 'BILL_FEE' }).sum('amount as total').count('id as count')
-    const [total_volume]  = await db('transactions').where({ status: 'SUCCESSFUL' }).sum('amount as total')
-
-    const daily = await db('fee_ledger')
-      .select(db.raw('DATE(created_at) as date'), db.raw('SUM(amount) as revenue'))
-      .where('created_at', '>=', db.raw("NOW() - INTERVAL '7 days'"))
-      .groupByRaw('DATE(created_at)')
-      .orderBy('date', 'asc')
-
-    const grand_total = [transfer_fees, merchant_fees, forex_margin, bill_fees]
-      .reduce((sum, f) => sum + parseFloat(f.total || 0), 0)
-
-    res.json({
-      revenue: {
-        transfer_fees: { total: parseFloat(transfer_fees.total || 0), count: parseInt(transfer_fees.count) },
-        merchant_fees: { total: parseFloat(merchant_fees.total || 0), count: parseInt(merchant_fees.count) },
-        forex_margin:  { total: parseFloat(forex_margin.total  || 0), count: parseInt(forex_margin.count)  },
-        bill_fees:     { total: parseFloat(bill_fees.total     || 0), count: parseInt(bill_fees.count)     },
-        grand_total,
-      },
-      platform_volume: parseFloat(total_volume.total || 0),
-      daily_revenue:   daily,
+    await trx('audit_logs').insert({
+      id: uuid(), actor_id: req.user.id, action: 'merchant_approved',
+      target_type: 'merchant', target_id: merchant.id,
+      description: 'Merchant approved', created_at: new Date(),
     })
-  } catch (err) {
-    logger.error('Revenue report failed', { err: err.message })
-    res.status(500).json({ error: 'Failed to fetch revenue report' })
-  }
+  })
+
+  return res.json({ message: 'Merchant approved' })
+})
+
+// ── POST /api/admin/merchants/:id/reject ────────────────────────
+router.post('/merchants/:id/reject', ...adminOnly, async (req, res) => {
+  const { reason } = req.body
+  const merchant   = await db('merchants').where({ id: req.params.id }).first()
+  if (!merchant) return res.status(404).json({ message: 'Not found' })
+
+  await db('merchants').where({ id: merchant.id }).update({ status: 'rejected', updated_at: new Date() })
+  await db('notifications').insert({
+    id: uuid(), user_id: merchant.user_id,
+    title: 'Merchant Application Rejected',
+    body: `Your merchant application was rejected. Reason: ${reason || 'Does not meet requirements.'}`,
+    type: 'error', created_at: new Date(), updated_at: new Date(),
+  })
+  await db('audit_logs').insert({
+    id: uuid(), actor_id: req.user.id, action: 'merchant_rejected',
+    target_type: 'merchant', target_id: merchant.id,
+    description: reason, created_at: new Date(),
+  })
+
+  return res.json({ message: 'Merchant rejected' })
+})
+
+// ── GET /api/admin/withdrawals ───────────────────────────────────
+router.get('/withdrawals', ...adminOnly, async (req, res) => {
+  const { status = 'pending' } = req.query
+  const withdrawals = await db('withdrawals as w')
+    .join('users as u', 'w.user_id', 'u.id')
+    .where('w.status', status)
+    .select('w.*', 'u.name as user_name', 'u.phone as user_phone', 'u.email as user_email')
+    .orderBy('w.created_at', 'asc')
+  return res.json({ withdrawals })
+})
+
+// ── GET /api/admin/revenue ───────────────────────────────────────
+router.get('/revenue', ...adminOnly, async (req, res) => {
+  const [total, bySource, last30Days] = await Promise.all([
+    db('platform_revenue').sum('amount as total').first(),
+    db('platform_revenue').groupBy('source').select('source').sum('amount as total'),
+    db('platform_revenue')
+      .where('created_at', '>=', new Date(Date.now() - 30 * 86400000))
+      .sum('amount as total').first(),
+  ])
+
+  return res.json({
+    totalRevenue:    parseFloat(total?.total || 0),
+    bySource,
+    last30DaysRevenue: parseFloat(last30Days?.total || 0),
+  })
+})
+
+// ── GET /api/admin/audit-logs ────────────────────────────────────
+router.get('/audit-logs', ...adminOnly, async (req, res) => {
+  const logs = await db('audit_logs as a')
+    .leftJoin('users as u', 'a.actor_id', 'u.id')
+    .select('a.*', 'u.name as actor_name', 'u.email as actor_email')
+    .orderBy('a.created_at', 'desc')
+    .limit(200)
+  return res.json({ logs })
 })
 
 module.exports = router
