@@ -1,328 +1,154 @@
-const express = require('express')
-const db      = require('../config/database')
-const logger  = require('../config/logger')
-const { authenticate, requireActive } = require('../middleware/auth')
-const { auditLog }                    = require('../middleware/audit')
-const { generateTxRef }               = require('../utils/helpers')
+// src/routes/bills.js  ← REPLACEMENT
+const express  = require('express')
+const { v4: uuid } = require('uuid')
+const db       = require('../db')
+const logger   = require('../config/logger')
+const { authenticate } = require('../middleware/auth')
 
 const router = express.Router()
-router.use(authenticate, requireActive)
 
-// ── NANEPAY FEE: 1% on all bill payments ─────────────────────
-const NANEPAY_FEE = 0.01
+// ── SUPPORTED BILLERS ─────────────────────────────────────────
+const BILLERS = [
+  { id: 'kplc_prepaid',  name: 'KPLC Prepaid',   category: 'electricity', icon: '⚡', paybill: '888880' },
+  { id: 'kplc_postpaid', name: 'KPLC Postpaid',  category: 'electricity', icon: '⚡', paybill: '888882' },
+  { id: 'nairobi_water', name: 'Nairobi Water',  category: 'water',       icon: '💧', paybill: '444700' },
+  { id: 'dstv',          name: 'DStv',            category: 'tv',          icon: '📺', paybill: '444900' },
+  { id: 'gotv',          name: 'GOtv',            category: 'tv',          icon: '📺', paybill: '444950' },
+  { id: 'zuku',          name: 'Zuku',            category: 'internet',    icon: '🌐', paybill: '222222' },
+  { id: 'safaricom_home',name: 'Safaricom Home',  category: 'internet',    icon: '🌐', paybill: '777700' },
+  { id: 'nhif',          name: 'NHIF',            category: 'insurance',   icon: '🏥', paybill: '200999' },
+  { id: 'nssf',          name: 'NSSF',            category: 'pension',     icon: '🏦', paybill: '333200' },
+  { id: 'nairobi_rates', name: 'Nairobi County',  category: 'county',      icon: '🏛️', paybill: '222100' },
+]
 
-// ── WIFI PROVIDERS WITH PACKAGES ─────────────────────────────
-const WIFI_PROVIDERS = {
-  safaricom: {
-    name: 'Safaricom Home Fibre',
-    logo: '📶',
-    packages: [
-      { id: 'saf_1hr',   label: '1 Hour',    price: 20,   validity: '1 hour',   speed: '5 Mbps'  },
-      { id: 'saf_3hr',   label: '3 Hours',   price: 50,   validity: '3 hours',  speed: '5 Mbps'  },
-      { id: 'saf_6hr',   label: '6 Hours',   price: 80,   validity: '6 hours',  speed: '10 Mbps' },
-      { id: 'saf_12hr',  label: '12 Hours',  price: 130,  validity: '12 hours', speed: '10 Mbps' },
-      { id: 'saf_24hr',  label: '24 Hours',  price: 200,  validity: '24 hours', speed: '20 Mbps' },
-      { id: 'saf_7day',  label: '7 Days',    price: 900,  validity: '7 days',   speed: '20 Mbps' },
-      { id: 'saf_30day', label: '30 Days',   price: 2999, validity: '30 days',  speed: '40 Mbps' },
-    ],
-  },
-  zuku: {
-    name: 'Zuku Fibre',
-    logo: '📶',
-    packages: [
-      { id: 'zuku_1hr',   label: '1 Hour',   price: 15,   validity: '1 hour',   speed: '4 Mbps'  },
-      { id: 'zuku_3hr',   label: '3 Hours',  price: 40,   validity: '3 hours',  speed: '4 Mbps'  },
-      { id: 'zuku_6hr',   label: '6 Hours',  price: 70,   validity: '6 hours',  speed: '8 Mbps'  },
-      { id: 'zuku_12hr',  label: '12 Hours', price: 110,  validity: '12 hours', speed: '8 Mbps'  },
-      { id: 'zuku_24hr',  label: '24 Hours', price: 180,  validity: '24 hours', speed: '15 Mbps' },
-      { id: 'zuku_7day',  label: '7 Days',   price: 750,  validity: '7 days',   speed: '15 Mbps' },
-      { id: 'zuku_30day', label: '30 Days',  price: 2499, validity: '30 days',  speed: '30 Mbps' },
-    ],
-  },
-  faiba: {
-    name: 'Faiba 4G',
-    logo: '📶',
-    packages: [
-      { id: 'faiba_1hr',   label: '1 Hour',   price: 10,   validity: '1 hour',   speed: '3 Mbps'  },
-      { id: 'faiba_3hr',   label: '3 Hours',  price: 25,   validity: '3 hours',  speed: '3 Mbps'  },
-      { id: 'faiba_6hr',   label: '6 Hours',  price: 50,   validity: '6 hours',  speed: '5 Mbps'  },
-      { id: 'faiba_12hr',  label: '12 Hours', price: 90,   validity: '12 hours', speed: '5 Mbps'  },
-      { id: 'faiba_24hr',  label: '24 Hours', price: 150,  validity: '24 hours', speed: '10 Mbps' },
-      { id: 'faiba_7day',  label: '7 Days',   price: 600,  validity: '7 days',   speed: '10 Mbps' },
-      { id: 'faiba_30day', label: '30 Days',  price: 1999, validity: '30 days',  speed: '20 Mbps' },
-    ],
-  },
-  airtel: {
-    name: 'Airtel Home',
-    logo: '📶',
-    packages: [
-      { id: 'airtel_1hr',   label: '1 Hour',   price: 15,   validity: '1 hour',   speed: '4 Mbps'  },
-      { id: 'airtel_3hr',   label: '3 Hours',  price: 35,   validity: '3 hours',  speed: '4 Mbps'  },
-      { id: 'airtel_6hr',   label: '6 Hours',  price: 65,   validity: '6 hours',  speed: '8 Mbps'  },
-      { id: 'airtel_12hr',  label: '12 Hours', price: 100,  validity: '12 hours', speed: '8 Mbps'  },
-      { id: 'airtel_24hr',  label: '24 Hours', price: 170,  validity: '24 hours', speed: '15 Mbps' },
-      { id: 'airtel_7day',  label: '7 Days',   price: 700,  validity: '7 days',   speed: '15 Mbps' },
-      { id: 'airtel_30day', label: '30 Days',  price: 2299, validity: '30 days',  speed: '25 Mbps' },
-    ],
-  },
-  custom: {
-    name: 'Custom Hotspot',
-    logo: '📶',
-    packages: [
-      { id: 'custom_30min', label: '30 Minutes', price: 5,  validity: '30 mins',  speed: 'Varies' },
-      { id: 'custom_1hr',   label: '1 Hour',     price: 10, validity: '1 hour',   speed: 'Varies' },
-      { id: 'custom_2hr',   label: '2 Hours',    price: 20, validity: '2 hours',  speed: 'Varies' },
-      { id: 'custom_3hr',   label: '3 Hours',    price: 30, validity: '3 hours',  speed: 'Varies' },
-      { id: 'custom_6hr',   label: '6 Hours',    price: 50, validity: '6 hours',  speed: 'Varies' },
-      { id: 'custom_12hr',  label: '12 Hours',   price: 80, validity: '12 hours', speed: 'Varies' },
-      { id: 'custom_24hr',  label: '24 Hours',   price: 120, validity: '24 hours', speed: 'Varies' },
-    ],
-  },
-}
+// ── GET /api/bills/billers ────────────────────────────────────
+router.get('/billers', authenticate, (req, res) => {
+  const { category } = req.query
+  const filtered = category
+    ? BILLERS.filter(b => b.category === category)
+    : BILLERS
 
-// ── OTHER BILL TYPES ──────────────────────────────────────────
-const BILL_TYPES = {
-  ELECTRICITY: {
-    label: 'Electricity', icon: '⚡',
-    providers: [
-      { id: 'kplc_prepaid',  name: 'KPLC Prepaid Token' },
-      { id: 'kplc_postpaid', name: 'KPLC Postpaid'      },
-    ],
-  },
-  WATER: {
-    label: 'Water', icon: '💧',
-    providers: [
-      { id: 'nairobi_water', name: 'Nairobi Water' },
-      { id: 'mombasa_water', name: 'Mombasa Water' },
-      { id: 'kisumu_water',  name: 'Kisumu Water'  },
-    ],
-  },
-  SCHOOL: {
-    label: 'School Fees', icon: '🎓',
-    providers: [
-      { id: 'primary',    name: 'Primary School'    },
-      { id: 'secondary',  name: 'Secondary School'  },
-      { id: 'university', name: 'University / TVET' },
-    ],
-  },
-  RENT: {
-    label: 'Rent', icon: '🏠',
-    providers: [
-      { id: 'residential', name: 'Residential Rent' },
-      { id: 'commercial',  name: 'Commercial Rent'  },
-    ],
-  },
-}
-
-// ── GET /api/bills/wifi-providers ─────────────────────────────
-router.get('/wifi-providers', (req, res) => {
-  const providers = Object.entries(WIFI_PROVIDERS).map(([id, p]) => ({
-    id,
-    name:     p.name,
-    logo:     p.logo,
-    packages: p.packages,
-  }))
-  res.json({ providers })
+  const categories = [...new Set(BILLERS.map(b => b.category))]
+  return res.json({ billers: filtered, categories })
 })
 
-// ── GET /api/bills/types ──────────────────────────────────────
-router.get('/types', (req, res) => {
-  const types = Object.entries(BILL_TYPES).map(([key, val]) => ({
-    type: key,
-    ...val,
-    fee_pct: '1%',
-    fee_rate: NANEPAY_FEE,
-  }))
-  res.json({ types })
-})
-
-// ── POST /api/bills/wifi ──────────────────────────────────────
-// Pay for a WiFi package — NanePay charges 1%
-router.post('/wifi', async (req, res) => {
-  const userId      = req.user.userId
-  const { provider_id, package_id, account_number } = req.body
-
-  if (!provider_id || !package_id || !account_number) {
-    return res.status(400).json({ error: 'provider_id, package_id and account_number are required' })
-  }
-
-  const provider = WIFI_PROVIDERS[provider_id]
-  if (!provider) return res.status(400).json({ error: 'Invalid WiFi provider' })
-
-  const pkg = provider.packages.find(p => p.id === package_id)
-  if (!pkg) return res.status(400).json({ error: 'Invalid package' })
-
-  const amount = pkg.price
-  const fee    = parseFloat((amount * NANEPAY_FEE).toFixed(2))
-  const total  = parseFloat((amount + fee).toFixed(2))
-
+// ── GET /api/bills/history ────────────────────────────────────
+router.get('/history', authenticate, async (req, res) => {
   try {
-    const result = await db.transaction(async (trx) => {
-      const wallet = await trx('wallets')
-        .where({ user_id: userId }).forUpdate().first()
+    const bills = await db('transactions')
+      .where({ user_id: req.user.id, type: 'bill_payment' })
+      .orderBy('created_at', 'desc')
+      .limit(50)
 
-      if (parseFloat(wallet.balance) < total) {
-        throw new Error('INSUFFICIENT_BALANCE')
-      }
-
-      await trx('wallets').where({ user_id: userId })
-        .decrement('balance', total)
-        .update({ updated_at: new Date() })
-
-      const reference = generateTxRef()
-
-      const [tx] = await trx('transactions').insert({
-        sender_id:   userId,
-        amount,
-        fee,
-        net_amount:  amount,
-        type:        'BILL_PAYMENT',
-        status:      'SUCCESSFUL',
-        reference,
-        description: `WiFi — ${provider.name} ${pkg.label} (${pkg.validity})`,
-        metadata:    JSON.stringify({
-          bill_type:      'WIFI',
-          provider_id,
-          provider_name:  provider.name,
-          package_id,
-          package_label:  pkg.label,
-          validity:       pkg.validity,
-          speed:          pkg.speed,
-          account_number,
-        }),
-        created_at: new Date(),
-      }).returning('*')
-
-      await trx('fee_ledger').insert({
-        amount:     fee,
-        type:       'BILL_FEE',
-        created_at: new Date(),
-      })
-
-      return { tx, reference }
-    })
-
-    await auditLog(req, 'WIFI_PAYMENT', { provider_id, package_id, amount, fee })
-    logger.info('WiFi payment successful', { userId, provider_id, package_id, amount })
-
-    res.json({
-      message:        'WiFi payment successful',
-      reference:      result.reference,
-      provider:       provider.name,
-      package:        pkg.label,
-      validity:       pkg.validity,
-      speed:          pkg.speed,
-      account_number,
-      amount,
-      fee,
-      total_charged:  total,
-      fee_pct:        '1%',
-    })
+    return res.json({ bills })
   } catch (err) {
-    if (err.message === 'INSUFFICIENT_BALANCE') {
-      return res.status(400).json({ error: 'Insufficient balance' })
-    }
-    logger.error('WiFi payment failed', { err: err.message })
-    res.status(500).json({ error: 'Payment failed. Please try again.' })
+    logger.error('Failed to fetch bill history', { err: err.message })
+    return res.status(500).json({ error: 'Failed to fetch bill history' })
   }
 })
 
 // ── POST /api/bills/pay ───────────────────────────────────────
-// Pay electricity, water, school, rent — NanePay charges 1%
-router.post('/pay', async (req, res) => {
-  const userId   = req.user.userId
-  const { type, provider_id, account_number, amount } = req.body
+router.post('/pay', authenticate, async (req, res) => {
+  const { billerId, accountNumber, amount } = req.body
 
-  if (!type || !amount || !account_number) {
-    return res.status(400).json({ error: 'type, account_number and amount are required' })
+  if (!billerId || !accountNumber || !amount || parseFloat(amount) <= 0) {
+    return res.status(400).json({ error: 'billerId, accountNumber, and amount are required' })
   }
 
-  const billType = BILL_TYPES[type.toUpperCase()]
-  if (!billType) return res.status(400).json({ error: 'Invalid bill type' })
+  const biller = BILLERS.find(b => b.id === billerId)
+  if (!biller) {
+    return res.status(400).json({ error: `Unsupported biller: ${billerId}` })
+  }
 
-  const parsedAmount = parseFloat(amount)
-  if (parsedAmount < 1) return res.status(400).json({ error: 'Amount must be at least KES 1' })
-
-  const fee   = parseFloat((parsedAmount * NANEPAY_FEE).toFixed(2))
-  const total = parseFloat((parsedAmount + fee).toFixed(2))
+  const amt = parseFloat(amount)
 
   try {
-    const result = await db.transaction(async (trx) => {
+    await db.transaction(async trx => {
+      // Lock and check wallet
       const wallet = await trx('wallets')
-        .where({ user_id: userId }).forUpdate().first()
+        .where({ user_id: req.user.id })
+        .forUpdate()
+        .first()
 
-      if (parseFloat(wallet.balance) < total) {
-        throw new Error('INSUFFICIENT_BALANCE')
-      }
+      if (!wallet) throw new Error('WALLET_NOT_FOUND')
+      if (parseFloat(wallet.available_balance) < amt) throw new Error('INSUFFICIENT_BALANCE')
 
-      await trx('wallets').where({ user_id: userId })
-        .decrement('balance', total)
-        .update({ updated_at: new Date() })
-
-      const reference = generateTxRef()
-
-      const [tx] = await trx('transactions').insert({
-        sender_id:   userId,
-        amount:      parsedAmount,
-        fee,
-        net_amount:  parsedAmount,
-        type:        'BILL_PAYMENT',
-        status:      'SUCCESSFUL',
-        reference,
-        description: `${billType.label} — ${account_number}`,
-        metadata:    JSON.stringify({ bill_type: type, provider_id, account_number }),
-        created_at:  new Date(),
-      }).returning('*')
-
-      await trx('fee_ledger').insert({
-        amount:     fee,
-        type:       'BILL_FEE',
-        created_at: new Date(),
+      // Deduct from wallet
+      await trx('wallets').where({ user_id: req.user.id }).update({
+        available_balance: db.raw('available_balance - ?', [amt]),
+        total_balance:     db.raw('total_balance - ?', [amt]),
+        updated_at:        new Date(),
       })
 
-      return { tx, reference }
+      // Record transaction
+      const ref = `BILL-${uuid().split('-')[0].toUpperCase()}`
+      await trx('transactions').insert({
+        id:          uuid(),
+        user_id:     req.user.id,
+        type:        'bill_payment',
+        amount:      amt,
+        fee:         0,
+        net_amount:  amt,
+        status:      'completed',
+        reference:   ref,
+        description: `${biller.name} — Account: ${accountNumber}`,
+        metadata:    JSON.stringify({
+          biller_id:      billerId,
+          biller_name:    biller.name,
+          paybill:        biller.paybill,
+          account_number: accountNumber,
+          category:       biller.category,
+        }),
+        created_at:  new Date(),
+        updated_at:  new Date(),
+      })
+
+      // Ledger entry
+      await trx('ledger').insert({
+        id:             uuid(),
+        user_id:        req.user.id,
+        wallet_id:      wallet.id,
+        type:           'wifi_purchase', // reusing closest type
+        amount:         amt,
+        balance_before: parseFloat(wallet.available_balance),
+        balance_after:  parseFloat(wallet.available_balance) - amt,
+        reference:      `LED-${ref}`,
+        description:    `Bill payment — ${biller.name}`,
+        status:         'completed',
+        metadata:       JSON.stringify({ billerId, accountNumber }),
+        created_at:     new Date(),
+        updated_at:     new Date(),
+      })
+
+      // Notification
+      await trx('notifications').insert({
+        id:         uuid(),
+        user_id:    req.user.id,
+        title:      'Bill Payment Successful',
+        body:       `KES ${amt} paid to ${biller.name} for account ${accountNumber}`,
+        type:       'payment',
+        data:       JSON.stringify({ billerId, amount: amt, reference: ref }),
+        created_at: new Date(),
+        updated_at: new Date(),
+      })
     })
 
-    await auditLog(req, 'BILL_PAYMENT', { type, amount: parsedAmount, fee })
-
-    res.json({
-      message:       'Payment successful',
-      reference:     result.reference,
-      bill_type:     billType.label,
-      account_number,
-      amount:        parsedAmount,
-      fee,
-      total_charged: total,
-      fee_pct:       '1%',
+    return res.json({
+      message:        'Bill payment successful',
+      biller:         biller.name,
+      account_number: accountNumber,
+      amount:         amt,
     })
+
   } catch (err) {
     if (err.message === 'INSUFFICIENT_BALANCE') {
       return res.status(400).json({ error: 'Insufficient balance' })
     }
+    if (err.message === 'WALLET_NOT_FOUND') {
+      return res.status(404).json({ error: 'Wallet not found' })
+    }
     logger.error('Bill payment failed', { err: err.message })
-    res.status(500).json({ error: 'Payment failed. Please try again.' })
-  }
-})
-
-// ── GET /api/bills/history ────────────────────────────────────
-router.get('/history', async (req, res) => {
-  const userId = req.user.userId
-  try {
-    const bills = await db('transactions')
-      .where({ sender_id: userId, type: 'BILL_PAYMENT' })
-      .orderBy('created_at', 'desc')
-      .limit(50)
-
-    res.json({
-      bills: bills.map(b => ({
-        ...b,
-        amount:   parseFloat(b.amount),
-        fee:      parseFloat(b.fee || 0),
-        metadata: b.metadata ? JSON.parse(b.metadata) : {},
-      }))
-    })
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch bill history' })
+    return res.status(500).json({ error: 'Payment failed. Please try again.' })
   }
 })
 
