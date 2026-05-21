@@ -1,63 +1,81 @@
-const jwt    = require('jsonwebtoken')
-const db     = require('../config/database')
-const logger = require('../config/logger')
+// src/middleware/auth.js  ← REPLACEMENT
+const jwt = require('jsonwebtoken')
+const db  = require('../db')
 
-const authenticate = (req, res, next) => {
-  const header = req.headers['authorization']
-  const token  = header && header.startsWith('Bearer ')
-    ? header.split(' ')[1]
-    : null
+// ─────────────────────────────────────────────────────────────
+// AUTHENTICATE — verifies JWT and attaches user to req
+// ─────────────────────────────────────────────────────────────
 
-  if (!token) {
-    return res.status(401).json({ error: 'Access token required' })
-  }
-
+const authenticate = async (req, res, next) => {
   try {
+    const header = req.headers.authorization
+
+    if (!header || !header.startsWith('Bearer ')) {
+      return res.status(401).json({ message: 'No token provided' })
+    }
+
+    const token   = header.split(' ')[1]
     const decoded = jwt.verify(token, process.env.JWT_SECRET)
-    req.user = decoded
+
+    const user = await db('users').where({ id: decoded.id }).first()
+
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' })
+    }
+
+    if (user.is_banned) {
+      return res.status(403).json({ message: 'Account suspended. Contact support.' })
+    }
+
+    req.user = user
     next()
+
   } catch (err) {
     if (err.name === 'TokenExpiredError') {
-      return res.status(401).json({ error: 'Token expired. Please login again.' })
+      return res.status(401).json({ message: 'Token expired. Please sign in again.' })
     }
-    return res.status(403).json({ error: 'Invalid token' })
+    return res.status(401).json({ message: 'Invalid token' })
   }
 }
 
-const requireAdmin = async (req, res, next) => {
-  try {
-    const user = await db('users')
-      .where({ id: req.user.userId })
-      .select('role', 'is_active')
-      .first()
+// ─────────────────────────────────────────────────────────────
+// REQUIRE ROLE — restricts route to specific roles
+// Usage: requireRole('admin') or requireRole('merchant', 'admin')
+// ─────────────────────────────────────────────────────────────
 
-    if (!user || user.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin access required' })
+const requireRole = (...roles) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ message: 'Not authenticated' })
     }
-    if (!user.is_active) {
-      return res.status(403).json({ error: 'Account suspended' })
+
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({
+        message: `Access denied. Required role: ${roles.join(' or ')}`
+      })
     }
+
     next()
-  } catch (err) {
-    logger.error('Admin check failed', { err: err.message })
-    res.status(500).json({ error: 'Authorization check failed' })
   }
 }
 
-const requireActive = async (req, res, next) => {
+// ─────────────────────────────────────────────────────────────
+// OPTIONAL AUTH — attaches user if token present, never blocks
+// ─────────────────────────────────────────────────────────────
+
+const optionalAuth = async (req, res, next) => {
   try {
-    const user = await db('users')
-      .where({ id: req.user.userId })
-      .select('is_active')
-      .first()
-
-    if (!user?.is_active) {
-      return res.status(403).json({ error: 'Your account has been suspended. Contact support.' })
+    const header = req.headers.authorization
+    if (header && header.startsWith('Bearer ')) {
+      const token   = header.split(' ')[1]
+      const decoded = jwt.verify(token, process.env.JWT_SECRET)
+      const user    = await db('users').where({ id: decoded.id }).first()
+      if (user && !user.is_banned) req.user = user
     }
-    next()
-  } catch (err) {
-    next(err)
+  } catch {
+    // silently ignore — optional auth never blocks
   }
+  next()
 }
 
-module.exports = { authenticate, requireAdmin, requireActive }
+module.exports = { authenticate, requireRole, optionalAuth }
