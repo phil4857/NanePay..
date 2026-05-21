@@ -1,76 +1,26 @@
-const express = require('express')
-const axios   = require('axios')
-const db      = require('../config/database')
-const logger  = require('../config/logger')
+const express  = require('express')
+const axios    = require('axios')
+const db       = require('../config/database')
+const logger   = require('../config/logger')
 const { authenticate, requireActive } = require('../middleware/auth')
 
 const router = express.Router()
 
-// ── Helper: call MikroTik REST API ────────────────────────────
-function mikrotikCall(routerRecord, endpoint, method, data) {
-  method = method || 'GET'
-  return axios({
-    method:  method,
-    url:     'http://' + routerRecord.ip_address + ':' + (routerRecord.port || 80) + '/rest' + endpoint,
-    auth:    { username: routerRecord.username, password: routerRecord.password_encrypted },
-    timeout: 10000,
-    data:    data || undefined,
+// ── Mikrotik API helper ───────────────────────────────────────
+async function mikrotikRequest(router_url, username, password, command, params = {}) {
+  const url = `${router_url}/rest${command}`
+  const response = await axios({
+    method: Object.keys(params).length ? 'post' : 'get',
+    url,
+    auth: { username, password },
+    data: Object.keys(params).length ? params : undefined,
+    timeout: 8000,
   })
-  .then(function(res) { return { success: true,  data:  res.data      } })
-  .catch(function(err){ return { success: false, error: err.message   } })
+  return response.data
 }
 
-// ── Helper: format MikroTik uptime string ─────────────────────
-function formatUptime(type, value) {
-  if (type === 'MINUTES') return '00:' + String(value).padStart(2, '0') + ':00'
-  if (type === 'HOURS')   return String(value).padStart(2, '0') + ':00:00'
-  if (type === 'DAYS')    return value + 'd00:00:00'
-  return '01:00:00'
-}
-
-// ── POST /api/mikrotik/routers — add a router ─────────────────
-router.post('/routers', authenticate, requireActive, async (req, res) => {
-  const userId = req.user.userId
-  const { name, type, ip_address, port, username, password, api_endpoint, api_key } = req.body
-
-  if (!name || !ip_address) {
-    return res.status(400).json({ error: 'name and ip_address are required' })
-  }
-
-  try {
-    const merchant = await db('merchant_profiles')
-      .where({ user_id: userId })
-      .first()
-
-    if (!merchant) {
-      return res.status(403).json({ error: 'Merchant profile required' })
-    }
-
-    const inserted = await db('routers').insert({
-      merchant_id:        merchant.id,
-      name:               name,
-      type:               (type || 'MIKROTIK').toUpperCase(),
-      ip_address:         ip_address,
-      port:               port || 8728,
-      username:           username || 'admin',
-      password_encrypted: password || '',
-      api_endpoint:       api_endpoint || null,
-      api_key_router:     api_key || null,
-      is_online:          false,
-      created_at:         new Date(),
-    }).returning('*')
-
-    const routerRecord = inserted[0]
-    routerRecord.password_encrypted = undefined
-
-    res.status(201).json({ message: 'Router added', router: routerRecord })
-  } catch (err) {
-    logger.error('Add router failed', { err: err.message })
-    res.status(500).json({ error: 'Failed to add router' })
-  }
-})
-
-// ── GET /api/mikrotik/routers — list merchant routers ─────────
+// ── GET /api/mikrotik/routers ─────────────────────────────────
+// List all routers belonging to the authenticated merchant
 router.get('/routers', authenticate, requireActive, async (req, res) => {
   try {
     const merchant = await db('merchant_profiles')
@@ -81,144 +31,29 @@ router.get('/routers', authenticate, requireActive, async (req, res) => {
       return res.status(403).json({ error: 'Merchant profile required' })
     }
 
-    const routers = await db('routers').where({ merchant_id: merchant.id })
+    const routers = await db('mikrotik_routers')
+      .where({ merchant_id: merchant.id })
+      .select('id', 'name', 'router_url', 'is_active', 'created_at')
+      .orderBy('created_at', 'desc')
 
-    const sanitized = routers.map(function(r) {
-      return Object.assign({}, r, { password_encrypted: undefined })
-    })
-
-    res.json({ routers: sanitized })
+    res.json({ routers })
   } catch (err) {
+    logger.error('Get routers failed', { err: err.message })
     res.status(500).json({ error: 'Failed to fetch routers' })
   }
 })
 
-// ── POST /api/mikrotik/routers/:id/test — test connection ─────
-router.post('/routers/:id/test', authenticate, requireActive, async (req, res) => {
-  try {
-    const routerRecord = await db('routers').where({ id: req.params.id }).first()
-    if (!routerRecord) {
-      return res.status(404).json({ error: 'Router not found' })
-    }
+// ── POST /api/mikrotik/routers ────────────────────────────────
+// Register a new Mikrotik router for a merchant
+router.post('/routers', authenticate, requireActive, async (req, res) => {
+  const { name, router_url, api_username, api_password } = req.body
 
-    const result = await mikrotikCall(routerRecord, '/system/identity')
-
-    await db('routers').where({ id: routerRecord.id }).update({
-      is_online: result.success,
-      last_seen: result.success ? new Date() : routerRecord.last_seen,
+  if (!name || !router_url || !api_username || !api_password) {
+    return res.status(400).json({
+      error: 'name, router_url, api_username and api_password are required',
     })
-
-    res.json({
-      connected: result.success,
-      identity:  result.data  || null,
-      error:     result.error || null,
-    })
-  } catch (err) {
-    logger.error('Router test failed', { err: err.message })
-    res.status(500).json({ error: 'Connection test failed' })
-  }
-})
-
-// ── POST /api/mikrotik/activate — activate hotspot user ───────
-router.post('/activate', authenticate, requireActive, async (req, res) => {
-  const { subscription_id, router_id, mac_address } = req.body
-
-  if (!subscription_id || !router_id) {
-    return res.status(400).json({ error: 'subscription_id and router_id are required' })
   }
 
-  try {
-    const sub = await db('subscriptions as s')
-      .join('packages as p', 's.package_id', 'p.id')
-      .where({ 's.id': subscription_id })
-      .select('s.*', 'p.speed_profile', 'p.duration_type', 'p.duration_value')
-      .first()
-
-    if (!sub) {
-      return res.status(404).json({ error: 'Subscription not found' })
-    }
-    if (sub.status !== 'ACTIVE') {
-      return res.status(400).json({ error: 'Subscription is not active' })
-    }
-
-    const user         = await db('users').where({ id: sub.user_id }).first()
-    const routerRecord = await db('routers').where({ id: router_id }).first()
-
-    if (!routerRecord) {
-      return res.status(404).json({ error: 'Router not found' })
-    }
-
-    const hotspotUser = {
-      name:           user.phone,
-      password:       sub.id.slice(0, 8),
-      profile:        sub.speed_profile || 'default',
-      comment:        'NanePay-' + sub.id,
-      'mac-address':  mac_address || '',
-      'limit-uptime': formatUptime(sub.duration_type, sub.duration_value),
-    }
-
-    const result = await mikrotikCall(routerRecord, '/ip/hotspot/user', 'PUT', hotspotUser)
-
-    if (result.success) {
-      await db('hotspot_sessions').insert({
-        subscription_id: sub.id,
-        user_id:         sub.user_id,
-        mac_address:     mac_address || null,
-        status:          'ACTIVE',
-        started_at:      new Date(),
-      })
-
-      logger.info('Hotspot user activated', {
-        userId:   sub.user_id,
-        phone:    user.phone,
-        router:   routerRecord.name,
-      })
-    }
-
-    res.json({
-      success:     result.success,
-      credentials: { username: user.phone, password: sub.id.slice(0, 8) },
-      error:       result.error || null,
-      note:        result.success ? null : 'Subscription is active but router connection failed',
-    })
-  } catch (err) {
-    logger.error('MikroTik activate failed', { err: err.message })
-    res.status(500).json({ error: 'Activation failed. Please try again.' })
-  }
-})
-
-// ── POST /api/mikrotik/disconnect — disconnect a user ─────────
-router.post('/disconnect', authenticate, requireActive, async (req, res) => {
-  const { subscription_id, router_id } = req.body
-
-  if (!subscription_id || !router_id) {
-    return res.status(400).json({ error: 'subscription_id and router_id are required' })
-  }
-
-  try {
-    const sub          = await db('subscriptions').where({ id: subscription_id }).first()
-    const user         = await db('users').where({ id: sub.user_id }).first()
-    const routerRecord = await db('routers').where({ id: router_id }).first()
-
-    if (!routerRecord) {
-      return res.status(404).json({ error: 'Router not found' })
-    }
-
-    await mikrotikCall(routerRecord, '/ip/hotspot/user/' + user.phone, 'DELETE')
-
-    await db('hotspot_sessions')
-      .where({ subscription_id: subscription_id, status: 'ACTIVE' })
-      .update({ status: 'DISCONNECTED', ended_at: new Date() })
-
-    res.json({ success: true, message: 'User disconnected from hotspot' })
-  } catch (err) {
-    logger.error('MikroTik disconnect failed', { err: err.message })
-    res.status(500).json({ error: 'Disconnect failed' })
-  }
-})
-
-// ── GET /api/mikrotik/sessions — active sessions ──────────────
-router.get('/sessions', authenticate, requireActive, async (req, res) => {
   try {
     const merchant = await db('merchant_profiles')
       .where({ user_id: req.user.userId })
@@ -228,25 +63,268 @@ router.get('/sessions', authenticate, requireActive, async (req, res) => {
       return res.status(403).json({ error: 'Merchant profile required' })
     }
 
-    const sessions = await db('hotspot_sessions as hs')
-      .join('subscriptions as s', 'hs.subscription_id', 's.id')
-      .join('users as u',         'hs.user_id',         'u.id')
-      .join('packages as p',      's.package_id',       'p.id')
-      .where({ 's.merchant_id': merchant.id })
-      .select(
-        'hs.*',
-        'u.name as user_name',
-        'u.phone as user_phone',
-        'p.name as package_name',
-        'p.speed_profile',
-      )
-      .orderBy('hs.started_at', 'desc')
-      .limit(100)
+    // Test connection before saving
+    await mikrotikRequest(router_url, api_username, api_password, '/system/identity')
 
-    res.json({ sessions })
+    const [router_record] = await db('mikrotik_routers').insert({
+      merchant_id:  merchant.id,
+      name:         name.trim(),
+      router_url:   router_url.trim(),
+      api_username: api_username.trim(),
+      api_password: api_password,
+      is_active:    true,
+      created_at:   new Date(),
+    }).returning('id', 'name', 'router_url', 'is_active', 'created_at')
+
+    res.status(201).json({ message: 'Router registered', router: router_record })
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch sessions' })
+    if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT') {
+      return res.status(400).json({ error: 'Could not connect to router. Check the URL and credentials.' })
+    }
+    logger.error('Register router failed', { err: err.message })
+    res.status(500).json({ error: 'Failed to register router' })
   }
 })
+
+// ── GET /api/mikrotik/routers/:id/status ─────────────────────
+// Ping a router to check if it is online
+router.get('/routers/:id/status', authenticate, requireActive, async (req, res) => {
+  try {
+    const merchant = await db('merchant_profiles')
+      .where({ user_id: req.user.userId })
+      .first()
+
+    if (!merchant) {
+      return res.status(403).json({ error: 'Merchant profile required' })
+    }
+
+    const router_record = await db('mikrotik_routers')
+      .where({ id: req.params.id, merchant_id: merchant.id })
+      .first()
+
+    if (!router_record) {
+      return res.status(404).json({ error: 'Router not found' })
+    }
+
+    const identity = await mikrotikRequest(
+      router_record.router_url,
+      router_record.api_username,
+      router_record.api_password,
+      '/system/identity'
+    )
+
+    const resource = await mikrotikRequest(
+      router_record.router_url,
+      router_record.api_username,
+      router_record.api_password,
+      '/system/resource'
+    )
+
+    res.json({
+      online:   true,
+      identity: identity?.name || 'Unknown',
+      uptime:   resource?.uptime,
+      cpu_load: resource?.['cpu-load'],
+      memory:   resource?.['free-memory'],
+    })
+  } catch (err) {
+    res.json({ online: false, error: 'Router unreachable' })
+  }
+})
+
+// ── POST /api/mikrotik/provision ──────────────────────────────
+// Create a hotspot user on the router when a subscription is activated
+router.post('/provision', authenticate, requireActive, async (req, res) => {
+  const { subscription_id } = req.body
+
+  if (!subscription_id) {
+    return res.status(400).json({ error: 'subscription_id is required' })
+  }
+
+  try {
+    const sub = await db('subscriptions as s')
+      .join('packages as p',          's.package_id',  'p.id')
+      .join('merchant_profiles as m',  's.merchant_id', 'm.id')
+      .join('users as u',              's.user_id',     'u.id')
+      .where({ 's.id': subscription_id, 's.user_id': req.user.userId })
+      .select(
+        's.id as sub_id',
+        's.status',
+        's.expires_at',
+        'p.speed_profile',
+        'p.device_limit',
+        'p.duration_type',
+        'p.duration_value',
+        'm.id as merchant_id',
+        'u.phone',
+      )
+      .first()
+
+    if (!sub) {
+      return res.status(404).json({ error: 'Subscription not found' })
+    }
+
+    if (sub.status !== 'ACTIVE') {
+      return res.status(400).json({ error: 'Subscription is not active' })
+    }
+
+    // Get the merchant's router
+    const router_record = await db('mikrotik_routers')
+      .where({ merchant_id: sub.merchant_id, is_active: true })
+      .first()
+
+    if (!router_record) {
+      return res.status(404).json({ error: 'No active router found for this merchant' })
+    }
+
+    // Generate hotspot credentials from phone number
+    const hs_username = `hs_${sub.phone.replace(/\D/g, '')}`
+    const hs_password = Math.random().toString(36).slice(-8)
+
+    // Build Mikrotik hotspot user profile name from speed_profile
+    const profile = sub.speed_profile || 'default'
+
+    // Create hotspot user on the router
+    await mikrotikRequest(
+      router_record.router_url,
+      router_record.api_username,
+      router_record.api_password,
+      '/ip/hotspot/user/add',
+      {
+        name:        hs_username,
+        password:    hs_password,
+        profile:     profile,
+        comment:     `NanePay sub:${sub.sub_id}`,
+        'limit-uptime': buildUptimeLimit(sub.duration_type, sub.duration_value),
+      }
+    )
+
+    // Save credentials to subscriptions table
+    await db('subscriptions')
+      .where({ id: subscription_id })
+      .update({ hotspot_username: hs_username, hotspot_password: hs_password })
+
+    logger.info('Hotspot user provisioned', { subscription_id, hs_username })
+
+    res.json({
+      message:  'Hotspot user provisioned',
+      username: hs_username,
+      password: hs_password,
+      profile,
+    })
+  } catch (err) {
+    if (err.response?.data) {
+      logger.error('Mikrotik provision error', { detail: err.response.data })
+      return res.status(500).json({ error: 'Router rejected the request', detail: err.response.data })
+    }
+    logger.error('Provision failed', { err: err.message })
+    res.status(500).json({ error: 'Failed to provision hotspot user' })
+  }
+})
+
+// ── DELETE /api/mikrotik/provision/:subscription_id ───────────
+// Remove hotspot user when subscription expires or is cancelled
+router.delete('/provision/:subscription_id', authenticate, requireActive, async (req, res) => {
+  try {
+    const sub = await db('subscriptions as s')
+      .join('merchant_profiles as m', 's.merchant_id', 'm.id')
+      .where({ 's.id': req.params.subscription_id, 's.user_id': req.user.userId })
+      .select('s.hotspot_username', 's.merchant_id')
+      .first()
+
+    if (!sub) {
+      return res.status(404).json({ error: 'Subscription not found' })
+    }
+
+    if (!sub.hotspot_username) {
+      return res.status(400).json({ error: 'No hotspot user linked to this subscription' })
+    }
+
+    const router_record = await db('mikrotik_routers')
+      .where({ merchant_id: sub.merchant_id, is_active: true })
+      .first()
+
+    if (!router_record) {
+      return res.status(404).json({ error: 'No active router found' })
+    }
+
+    // Find the hotspot user entry number on the router
+    const users = await mikrotikRequest(
+      router_record.router_url,
+      router_record.api_username,
+      router_record.api_password,
+      `/ip/hotspot/user?name=${sub.hotspot_username}`
+    )
+
+    if (users && users.length > 0) {
+      await mikrotikRequest(
+        router_record.router_url,
+        router_record.api_username,
+        router_record.api_password,
+        `/ip/hotspot/user/${users[0]['.id']}/delete`
+      )
+    }
+
+    await db('subscriptions')
+      .where({ id: req.params.subscription_id })
+      .update({ hotspot_username: null, hotspot_password: null })
+
+    logger.info('Hotspot user removed', { subscription_id: req.params.subscription_id })
+    res.json({ message: 'Hotspot user removed successfully' })
+  } catch (err) {
+    logger.error('Deprovision failed', { err: err.message })
+    res.status(500).json({ error: 'Failed to remove hotspot user' })
+  }
+})
+
+// ── GET /api/mikrotik/active-users/:router_id ─────────────────
+// List currently active hotspot sessions on a router
+router.get('/active-users/:router_id', authenticate, requireActive, async (req, res) => {
+  try {
+    const merchant = await db('merchant_profiles')
+      .where({ user_id: req.user.userId })
+      .first()
+
+    if (!merchant) {
+      return res.status(403).json({ error: 'Merchant profile required' })
+    }
+
+    const router_record = await db('mikrotik_routers')
+      .where({ id: req.params.router_id, merchant_id: merchant.id })
+      .first()
+
+    if (!router_record) {
+      return res.status(404).json({ error: 'Router not found' })
+    }
+
+    const active = await mikrotikRequest(
+      router_record.router_url,
+      router_record.api_username,
+      router_record.api_password,
+      '/ip/hotspot/active'
+    )
+
+    res.json({
+      count:        active?.length || 0,
+      active_users: (active || []).map(u => ({
+        user:       u.user,
+        ip:         u.address,
+        uptime:     u.uptime,
+        bytes_in:   u['bytes-in'],
+        bytes_out:  u['bytes-out'],
+      })),
+    })
+  } catch (err) {
+    logger.error('Active users fetch failed', { err: err.message })
+    res.status(500).json({ error: 'Failed to fetch active users' })
+  }
+})
+
+// ── Helper ────────────────────────────────────────────────────
+function buildUptimeLimit(duration_type, duration_value) {
+  const map = { HOURS: 'h', DAYS: 'd', WEEKS: 'w' }
+  const suffix = map[duration_type?.toUpperCase()] || 'd'
+  return `${duration_value}${suffix}`
+}
 
 module.exports = router
