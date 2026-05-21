@@ -1,71 +1,66 @@
-const { validationResult, body, param } = require('express-validator')
+// src/middleware/validate.js  ← NEW FILE
+const { validationResult, body } = require('express-validator')
 
+// Run validation and return errors if any
 const validate = (req, res, next) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
-    return res.status(400).json({
-      error:  'Validation failed',
-      errors: errors.array().map(e => ({ field: e.path, message: e.msg })),
+    return res.status(422).json({
+      message: errors.array()[0].msg,
+      errors:  errors.array(),
     })
   }
   next()
 }
 
+// Reusable validation rule sets
 const rules = {
   register: [
-    body('name').trim().notEmpty().withMessage('Name is required')
-      .isLength({ min: 2, max: 100 }),
-    body('email').trim().isEmail().withMessage('Valid email required').normalizeEmail(),
-    body('phone').trim().notEmpty().withMessage('Phone is required')
-      .matches(/^(254|0|)\d{9}$/).withMessage('Enter a valid Kenyan phone number'),
-    body('password').isLength({ min: 8 }).withMessage('Password must be at least 8 characters')
-      .matches(/\d/).withMessage('Password must contain at least one number'),
+    body('name').trim().notEmpty().withMessage('Name is required'),
+    body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
+    body('phone').matches(/^0[17]\d{8}$/).withMessage('Valid Kenyan phone required'),
+    body('password').isLength({ min: 8 }).withMessage('Password min 8 characters'),
   ],
 
   login: [
-    body('email').trim().isEmail().withMessage('Valid email required').normalizeEmail(),
+    body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
     body('password').notEmpty().withMessage('Password is required'),
   ],
 
   transfer: [
-    body('phone').trim().notEmpty().withMessage('Recipient phone is required')
-      .matches(/^(254|0|)\d{9}$/).withMessage('Enter a valid phone number'),
-    body('amount').isFloat({ min: 10 }).withMessage('Minimum transfer is KES 10')
-      .isFloat({ max: 1000000 }).withMessage('Maximum is KES 1,000,000'),
-    body('note').optional().trim().isLength({ max: 200 }),
+    body('toPhone').notEmpty().withMessage('Recipient phone is required'),
+    body('amount').isFloat({ min: 10 }).withMessage('Minimum transfer is KES 10'),
   ],
 
   deposit: [
-    body('amount').isFloat({ min: 10 }).withMessage('Minimum deposit is KES 10')
-      .isFloat({ max: 150000 }).withMessage('Maximum M-Pesa deposit is KES 150,000'),
+    body('amount').isFloat({ min: 1 }).withMessage('Minimum deposit is KES 1'),
   ],
 
-  withdraw: [
-    body('phone').optional().trim()
-      .matches(/^(254|0|)\d{9}$/).withMessage('Valid phone required'),
-    body('amount').isFloat({ min: 10 }).withMessage('Minimum withdrawal is KES 10')
-      .isFloat({ max: 150000 }).withMessage('Maximum withdrawal is KES 150,000'),
+  withdrawal: [
+    body('amount').isFloat({ min: 100 }).withMessage('Minimum withdrawal is KES 100'),
   ],
 
   forex: [
-    body('currency').isIn(['USD', 'GBP', 'EUR', 'TZS', 'UGX']).withMessage('Unsupported currency'),
-    body('amount').isFloat({ min: 1 }).withMessage('Amount must be greater than 0'),
+    body('currency').notEmpty().withMessage('Currency is required'),
     body('direction').isIn(['buy', 'sell']).withMessage('Direction must be buy or sell'),
+    body('amount').isFloat({ min: 1 }).withMessage('Amount must be greater than 0'),
   ],
 
   invest: [
-    body('plan_id').isIn(['flexi', '90day', 'growth']).withMessage('Invalid investment plan'),
-    body('amount').isFloat({ min: 500 }).withMessage('Minimum investment is KES 500'),
+    body('plan_id').notEmpty().withMessage('Plan ID is required'),
+    body('amount').isFloat({ min: 1 }).withMessage('Amount must be greater than 0'),
   ],
 
-  merchantRegister: [
-    body('business_name').trim().notEmpty().withMessage('Business name is required')
-      .isLength({ min: 2, max: 100 }),
-    body('business_type').trim().notEmpty().withMessage('Business type is required'),
+  package: [
+    body('name').trim().notEmpty().withMessage('Package name is required'),
+    body('price').isFloat({ min: 1 }).withMessage('Price must be greater than 0'),
+    body('duration_hours').isInt({ min: 1 }).withMessage('Duration must be at least 1 hour'),
   ],
 
-  txId: [
-    param('id').isUUID().withMessage('Invalid transaction ID'),
+  billPay: [
+    body('billerId').notEmpty().withMessage('Biller ID is required'),
+    body('accountNumber').notEmpty().withMessage('Account number is required'),
+    body('amount').isFloat({ min: 1 }).withMessage('Amount must be greater than 0'),
   ],
 }
 
