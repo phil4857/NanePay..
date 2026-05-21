@@ -1,130 +1,497 @@
+// src/routes/mpesa.js
+
 const express = require('express')
-const db      = require('../config/database')
-const logger  = require('../config/logger')
-const { authenticate, requireActive } = require('../middleware/auth')
-const { mpesaLimiter }                = require('../middleware/rateLimit')
-const { validate, rules }             = require('../middleware/validate')
-const { auditLog }                    = require('../middleware/audit')
-const { initiateSTKPush }             = require('../services/mpesa')
-const { generateTxRef, normalizePhone } = require('../utils/helpers')
+const { v4: uuid } = require('uuid')
+
+const db      = require('../db')
+const ledger  = require('../services/ledger')
+const mpesa   = require('../services/mpesa')
+
+const { authenticate } = require('../middleware/auth')
 
 const router = express.Router()
 
-router.post('/stk-push',
-  authenticate, requireActive, mpesaLimiter, rules.deposit, validate,
+/**
+ * ---------------------------------------------------------
+ * Helpers
+ * ---------------------------------------------------------
+ */
+
+function parseAmount(value) {
+  return parseFloat(Number(value).toFixed(2))
+}
+
+/**
+ * ---------------------------------------------------------
+ * POST /api/mpesa/stk-push
+ * Deposit request
+ * ---------------------------------------------------------
+ */
+
+router.post('/stk-push', authenticate, async (req, res) => {
+  try {
+    const amount = parseAmount(req.body.amount)
+    const user   = req.user
+
+    if (!amount || amount < 1) {
+      return res.status(400).json({
+        message: 'Minimum deposit is KES 1'
+      })
+    }
+
+    const DEPOSIT_FEE_RATE = parseFloat(
+      process.env.DEPOSIT_FEE_RATE || '0'
+    )
+
+    const fee   = parseAmount(amount * DEPOSIT_FEE_RATE)
+    const total = parseAmount(amount + fee)
+
+    const reference = `DEP-${uuid().split('-')[0].toUpperCase()}`
+
+    /**
+     * STK PUSH
+     */
+    const stk = await mpesa.stkPush({
+      phone: user.phone,
+      amount: total,
+      ref: reference,
+      desc: 'NanePay Deposit'
+    })
+
+    if (stk.ResponseCode !== '0') {
+      return res.status(400).json({
+        message:
+          stk.ResponseDescription ||
+          'Failed to initiate STK Push'
+      })
+    }
+
+    /**
+     * Store pending transaction
+     */
+    await db('transactions').insert({
+      id: uuid(),
+
+      user_id: user.id,
+
+      type: 'deposit',
+
+      amount,
+      fee,
+      net_amount: amount,
+
+      status: 'pending',
+
+      reference,
+
+      checkout_request_id: stk.CheckoutRequestID,
+      merchant_request_id: stk.MerchantRequestID,
+
+      description: 'M-Pesa wallet deposit',
+
+      metadata: JSON.stringify({
+        phone: user.phone,
+        total_charged: total
+      }),
+
+      created_at: new Date(),
+      updated_at: new Date()
+    })
+
+    return res.json({
+      success: true,
+      message:
+        'STK Push sent. Complete payment on your phone.',
+
+      reference,
+
+      amount,
+      fee,
+      total,
+
+      checkoutRequestId: stk.CheckoutRequestID
+    })
+  } catch (err) {
+    console.error('[STK PUSH ERROR]', err)
+
+    return res.status(500).json({
+      success: false,
+      message: 'Could not initiate payment'
+    })
+  }
+})
+
+/**
+ * ---------------------------------------------------------
+ * POST /api/mpesa/stk-callback
+ * Safaricom callback
+ * ---------------------------------------------------------
+ */
+
+router.post('/stk-callback', async (req, res) => {
+
+  // IMPORTANT:
+  // Always respond immediately
+  res.status(200).json({
+    ResultCode: 0,
+    ResultDesc: 'Accepted'
+  })
+
+  try {
+
+    const callback = req.body?.Body?.stkCallback
+
+    if (!callback) return
+
+    const checkoutId = callback.CheckoutRequestID
+    const resultCode = callback.ResultCode
+
+    console.log(
+      `[STK CALLBACK] ${checkoutId} => ${resultCode}`
+    )
+
+    /**
+     * Find transaction
+     */
+    const tx = await db('transactions')
+      .where({
+        checkout_request_id: checkoutId
+      })
+      .first()
+
+    if (!tx) {
+      console.log(
+        `[STK CALLBACK] Transaction not found`
+      )
+      return
+    }
+
+    /**
+     * Idempotency protection
+     */
+    if (
+      ['completed', 'failed'].includes(tx.status)
+    ) {
+      console.log(
+        `[STK CALLBACK] Duplicate callback ignored`
+      )
+      return
+    }
+
+    /**
+     * FAILED PAYMENT
+     */
+    if (resultCode !== 0) {
+
+      await db('transactions')
+        .where({ id: tx.id })
+        .update({
+          status: 'failed',
+
+          metadata: JSON.stringify({
+            ...(tx.metadata || {}),
+            resultCode,
+            resultDesc: callback.ResultDesc
+          }),
+
+          updated_at: new Date()
+        })
+
+      console.log(
+        `[STK CALLBACK] Payment failed`
+      )
+
+      return
+    }
+
+    /**
+     * SUCCESSFUL PAYMENT
+     */
+    const items = callback.CallbackMetadata?.Item || []
+
+    const getItem = name =>
+      items.find(i => i.Name === name)?.Value
+
+    const mpesaReceipt = getItem('MpesaReceiptNumber')
+    const paidAmount   = getItem('Amount')
+    const phone        = getItem('PhoneNumber')
+
+    /**
+     * Receipt duplication protection
+     */
+    const receiptExists = await db('transactions')
+      .where({ mpesa_receipt: mpesaReceipt })
+      .first()
+
+    if (receiptExists) {
+      console.log(
+        `[STK CALLBACK] Duplicate receipt ignored`
+      )
+      return
+    }
+
+    await db.transaction(async trx => {
+
+      /**
+       * Mark transaction completed
+       */
+      await trx('transactions')
+        .where({ id: tx.id })
+        .update({
+
+          status: 'completed',
+
+          mpesa_receipt: mpesaReceipt,
+
+          metadata: JSON.stringify({
+            paidAmount,
+            phone,
+            checkoutId
+          }),
+
+          updated_at: new Date()
+        })
+
+      /**
+       * Credit wallet using ledger
+       */
+      await ledger.deposit({
+        userId: tx.user_id,
+
+        amount: tx.net_amount,
+
+        reference: tx.reference,
+
+        mpesaReceipt,
+
+        metadata: {
+          checkoutId,
+          phone,
+          paidAmount
+        },
+
+        trx
+      })
+
+      /**
+       * Notification
+       */
+      const hasNotifications =
+        await trx.schema.hasTable('notifications')
+
+      if (hasNotifications) {
+        await trx('notifications').insert({
+          id: uuid(),
+
+          user_id: tx.user_id,
+
+          title: 'Deposit Successful',
+
+          body:
+            `KES ${tx.net_amount} deposited successfully`,
+
+          type: 'payment',
+
+          data: JSON.stringify({
+            amount: tx.net_amount,
+            receipt: mpesaReceipt
+          }),
+
+          created_at: new Date(),
+          updated_at: new Date()
+        })
+      }
+    })
+
+    console.log(
+      `[STK CALLBACK] Deposit completed: ${mpesaReceipt}`
+    )
+
+  } catch (err) {
+
+    console.error(
+      '[STK CALLBACK ERROR]',
+      err.message,
+      err.stack
+    )
+  }
+})
+
+/**
+ * ---------------------------------------------------------
+ * GET /api/mpesa/stk-status/:checkoutId
+ * ---------------------------------------------------------
+ */
+
+router.get(
+  '/stk-status/:checkoutId',
+  authenticate,
   async (req, res) => {
-    const userId = req.user.userId
-    const amount = parseFloat(req.body.amount)
 
     try {
-      const user      = await db('users').where({ id: userId }).select('phone', 'name').first()
-      const phone     = normalizePhone(user.phone)
-      const reference = generateTxRef()
 
-      const [pending] = await db('transactions').insert({
-        receiver_id: userId,
-        amount, fee: 0, net_amount: amount,
-        type:        'MPESA_DEPOSIT',
-        status:      'PENDING',
-        reference,
-        description: 'M-Pesa wallet deposit',
-        created_at:  new Date(),
-      }).returning('*')
+      const tx = await db('transactions')
+        .where({
+          checkout_request_id:
+            req.params.checkoutId,
 
-      let stkResponse
-      try {
-        stkResponse = await initiateSTKPush({ phone, amount, reference, description: 'NanePay Wallet Deposit' })
-      } catch (mpesaErr) {
-        await db('transactions').where({ id: pending.id }).update({ status: 'FAILED' })
+          user_id: req.user.id
+        })
+        .first()
 
-        if (mpesaErr.message.includes('not configured')) {
-          return res.json({
-            message: 'STK Push sent (MOCK MODE — add M-Pesa credentials to go live)',
-            transaction_id: pending.id,
-            reference,
-            checkout_request_id: 'MOCK-' + Date.now(),
-            mock: true,
-          })
-        }
-        return res.status(502).json({ error: 'Could not reach M-Pesa. Please try again.' })
+      if (!tx) {
+        return res.status(404).json({
+          message: 'Transaction not found'
+        })
       }
 
-      await db('transactions').where({ id: pending.id })
-        .update({ mpesa_checkout_id: stkResponse.CheckoutRequestID })
+      return res.json({
+        success: true,
 
-      await auditLog(req, 'MPESA_STK_PUSH', { amount, reference })
+        status: tx.status,
 
-      res.json({
-        message:             'STK Push sent. Enter your M-Pesa PIN on your phone.',
-        transaction_id:      pending.id,
-        reference,
-        checkout_request_id: stkResponse.CheckoutRequestID,
+        amount: tx.amount,
+
+        fee: tx.fee,
+
+        reference: tx.reference,
+
+        mpesaReceipt: tx.mpesa_receipt
       })
+
     } catch (err) {
-      logger.error('STK push error', { err: err.message })
-      res.status(500).json({ error: 'Deposit failed. Please try again.' })
+
+      console.error(err)
+
+      return res.status(500).json({
+        message: 'Could not fetch status'
+      })
     }
   }
 )
 
-// PUBLIC — no auth — Safaricom calls this
-router.post('/callback', async (req, res) => {
-  res.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+/**
+ * ---------------------------------------------------------
+ * POST /api/mpesa/b2c-result
+ * Withdrawal callback
+ * ---------------------------------------------------------
+ */
+
+router.post('/b2c-result', async (req, res) => {
+
+  res.status(200).json({
+    ResultCode: 0,
+    ResultDesc: 'Accepted'
+  })
 
   try {
-    const callback = req.body?.Body?.stkCallback
-    if (!callback) return
 
-    const { ResultCode, CheckoutRequestID, CallbackMetadata } = callback
+    const result = req.body?.Result
 
-    if (ResultCode !== 0) {
-      await db('transactions').where({ mpesa_checkout_id: CheckoutRequestID }).update({ status: 'FAILED' })
+    if (!result) return
+
+    const {
+      ResultCode,
+      TransactionID,
+      OriginatorConversationID
+    } = result
+
+    const withdrawal = await db('withdrawals')
+      .where({
+        reference: OriginatorConversationID
+      })
+      .first()
+
+    if (!withdrawal) return
+
+    /**
+     * SUCCESS
+     */
+    if (ResultCode === 0) {
+
+      await db('withdrawals')
+        .where({ id: withdrawal.id })
+        .update({
+
+          status: 'paid',
+
+          mpesa_receipt: TransactionID,
+
+          updated_at: new Date()
+        })
+
+      console.log(
+        `[B2C] Withdrawal paid`
+      )
+
       return
     }
 
-    const meta      = CallbackMetadata?.Item || []
-    const mpesaCode = meta.find(i => i.Name === 'MpesaReceiptNumber')?.Value
-    const amount    = parseFloat(meta.find(i => i.Name === 'Amount')?.Value || '0')
+    /**
+     * FAILED → refund wallet
+     */
+    await db.transaction(async trx => {
 
-    await db.transaction(async (trx) => {
-      const tx = await trx('transactions').where({ mpesa_checkout_id: CheckoutRequestID }).first()
-      if (!tx || tx.status === 'SUCCESSFUL') return
+      await trx('withdrawals')
+        .where({ id: withdrawal.id })
+        .update({
 
-      await trx('transactions').where({ id: tx.id })
-        .update({ status: 'SUCCESSFUL', mpesa_reference: mpesaCode, amount })
+          status: 'failed',
 
-      await trx('wallets').where({ user_id: tx.receiver_id })
-        .increment('balance', amount).update({ updated_at: new Date() })
+          updated_at: new Date()
+        })
 
-      logger.info('Wallet credited', { userId: tx.receiver_id, amount, mpesaCode })
+      await ledger.postEntry({
+        userId: withdrawal.user_id,
+
+        type: 'reversal',
+
+        amount: +withdrawal.net_amount,
+
+        reference:
+          `REV-${withdrawal.reference}`,
+
+        description:
+          'Withdrawal reversal',
+
+        metadata: {
+          withdrawalId: withdrawal.id
+        },
+
+        trx
+      })
     })
+
+    console.log(
+      `[B2C] Withdrawal reversed`
+    )
+
   } catch (err) {
-    logger.error('Callback error', { err: err.message })
+
+    console.error(
+      '[B2C RESULT ERROR]',
+      err.message
+    )
   }
 })
 
-router.get('/status/:checkoutId', authenticate, async (req, res) => {
-  try {
-    const tx = await db('transactions')
-      .where({ mpesa_checkout_id: req.params.checkoutId })
-      .select('status', 'amount', 'reference', 'mpesa_reference')
-      .first()
+/**
+ * ---------------------------------------------------------
+ * POST /api/mpesa/b2c-timeout
+ * ---------------------------------------------------------
+ */
 
-    if (!tx) return res.status(404).json({ error: 'Transaction not found' })
-    res.json(tx)
-  } catch (err) {
-    res.status(500).json({ error: 'Status check failed' })
-  }
-})
+router.post('/b2c-timeout', async (req, res) => {
 
-router.post('/b2c/result', async (req, res) => {
-  res.json({ ResultCode: 0, ResultDesc: 'Accepted' })
-  logger.info('B2C result received', { body: req.body })
-})
+  res.status(200).json({
+    ResultCode: 0,
+    ResultDesc: 'Accepted'
+  })
 
-router.post('/b2c/timeout', async (req, res) => {
-  res.json({ ResultCode: 0, ResultDesc: 'Accepted' })
-  logger.warn('B2C timeout', { body: req.body })
+  console.warn(
+    '[B2C TIMEOUT]',
+    JSON.stringify(req.body)
+  )
 })
 
 module.exports = router
