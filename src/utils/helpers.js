@@ -1,79 +1,66 @@
-const { v4: uuidv4 } = require('uuid')
+// src/utils/helpers.js  ← NEW FILE
+const { v4: uuid } = require('uuid')
 
-const generateTxRef = () => {
-  const date = new Date().toISOString().slice(0, 10).replace(/-/g, '')
-  const rand = uuidv4().replace(/-/g, '').slice(0, 6).toUpperCase()
-  return `NP-${date}-${rand}`
+// ── Transaction reference generator ──────────────────────────
+const generateTxRef = (prefix = 'NP') => {
+  return `${prefix}-${uuid().split('-')[0].toUpperCase()}-${Date.now().toString(36).toUpperCase()}`
 }
 
+// ── Platform fee constants ────────────────────────────────────
 const FEES = {
-  TRANSFER:      parseFloat(process.env.TRANSFER_FEE_RATE  || '0.01'),
-  MERCHANT:      parseFloat(process.env.MERCHANT_FEE_RATE  || '0.008'),
-  FOREX_MARKUP:  parseFloat(process.env.FOREX_MARKUP_PCT   || '0.02'),
-  INVEST_SPREAD: parseFloat(process.env.INVESTMENT_SPREAD  || '0.015'),
+  TRANSFER_FEE:    parseFloat(process.env.TRANSFER_FEE_RATE    || '0.01'),
+  WITHDRAWAL_FEE:  parseFloat(process.env.WITHDRAWAL_FEE_RATE  || '0.01'),
+  WIFI_FEE:        parseFloat(process.env.WIFI_FEE_RATE        || '0.01'),
+  FOREX_MARKUP:    parseFloat(process.env.FOREX_MARKUP         || '0.02'),
+  INVESTMENT_SPREAD: parseFloat(process.env.INVESTMENT_SPREAD  || '0.015'),
 }
 
-const calcFee = (amount, type = 'TRANSFER') => {
-  const rate = FEES[type] || FEES.TRANSFER
-  const fee  = parseFloat((amount * rate).toFixed(2))
-  const net  = parseFloat((amount - fee).toFixed(2))
-  return { amount, rate, fee, net }
-}
-
-const MID_RATES = {
-  USD: 129.5,
-  GBP: 163.2,
-  EUR: 140.8,
-  TZS: 0.0495,
-  UGX: 0.0338,
-}
-
-const getForexRate = (currency) => {
-  const mid = MID_RATES[currency]
-  if (!mid) return null
-  const markup = FEES.FOREX_MARKUP
-  return {
-    currency,
-    mid_rate:   mid,
-    buy_rate:   parseFloat((mid * (1 + markup)).toFixed(4)),
-    sell_rate:  parseFloat((mid * (1 - markup)).toFixed(4)),
-    markup_pct: markup * 100,
-  }
-}
-
+// ── Investment plans ──────────────────────────────────────────
 const INVESTMENT_PLANS = [
-  { id: 'flexi',  name: 'Flexi Save',  apy: 6.5,  nanepay_spread: 1.5, min_amount: 500,  lock_days: 0,   risk: 'LOW'    },
-  { id: '90day',  name: '90-Day Lock', apy: 9.0,  nanepay_spread: 1.5, min_amount: 2000, lock_days: 90,  risk: 'LOW'    },
-  { id: 'growth', name: 'Growth Fund', apy: 12.5, nanepay_spread: 1.5, min_amount: 5000, lock_days: 180, risk: 'MEDIUM' },
+  {
+    id:          'flexible',
+    name:        'Flexible',
+    apy:         0.05,
+    min_amount:  100,
+    lock_days:   0,
+    description: 'No lock-in, withdraw anytime. 5% annual return.',
+  },
+  {
+    id:          'starter',
+    name:        'Starter',
+    apy:         0.08,
+    min_amount:  500,
+    lock_days:   30,
+    description: 'Low risk, 8% annual return. Locked for 30 days.',
+  },
+  {
+    id:          'growth',
+    name:        'Growth',
+    apy:         0.15,
+    min_amount:  2000,
+    lock_days:   90,
+    description: 'Medium risk, 15% annual return. Locked for 90 days.',
+  },
+  {
+    id:          'premium',
+    name:        'Premium',
+    apy:         0.25,
+    min_amount:  10000,
+    lock_days:   180,
+    description: 'Higher return, 25% annual return. Locked for 180 days.',
+  },
 ]
 
-const calcInvestmentReturn = (amount, apyPercent, days) => {
-  const daily    = apyPercent / 100 / 365
-  const earnings = parseFloat((amount * daily * days).toFixed(2))
-  return { earnings, total: amount + earnings }
-}
-
-const normalizePhone = (phone) => {
-  const cleaned = String(phone).replace(/\D/g, '')
-  if (cleaned.startsWith('0'))   return '254' + cleaned.slice(1)
-  if (cleaned.startsWith('254')) return cleaned
-  return cleaned
-}
-
-const paginate = (query, page = 1, limit = 20) => {
-  const safeLimit = Math.min(parseInt(limit), 100)
-  const safePage  = Math.max(parseInt(page), 1)
-  const offset    = (safePage - 1) * safeLimit
-  return { limit: safeLimit, offset, page: safePage }
+// ── Investment return calculator ──────────────────────────────
+const calcInvestmentReturn = (principal, apy, days) => {
+  const earnings = parseFloat((principal * apy * (days / 365)).toFixed(2))
+  const total    = parseFloat((principal + earnings).toFixed(2))
+  return { earnings, total }
 }
 
 module.exports = {
   generateTxRef,
-  calcFee,
-  getForexRate,
+  FEES,
   INVESTMENT_PLANS,
   calcInvestmentReturn,
-  normalizePhone,
-  paginate,
-  FEES,
 }
