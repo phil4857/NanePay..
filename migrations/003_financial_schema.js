@@ -1,4 +1,4 @@
-// migrations/002_financial_schema.js  ← NEW FILE
+// migrations/003_financial_schema.js  ← NEW FILE
 
 exports.up = async knex => {
 
