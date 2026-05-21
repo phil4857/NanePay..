@@ -1,18 +1,24 @@
-const db     = require('../config/database')
-const logger = require('../config/logger')
+// src/middleware/audit.js  ← NEW FILE
+const { v4: uuid } = require('uuid')
+const db = require('../db')
 
 const auditLog = async (req, action, metadata = {}) => {
   try {
     await db('audit_logs').insert({
-      user_id:    req.user?.userId || null,
+      id:          uuid(),
+      actor_id:    req.user?.id || null,
       action,
-      ip_address: req.ip || req.socket?.remoteAddress,
-      user_agent: req.headers['user-agent'] || null,
-      metadata:   JSON.stringify(metadata),
-      created_at: new Date(),
+      target_type: metadata.target_type || null,
+      target_id:   metadata.target_id   || null,
+      description: metadata.description || action,
+      before:      JSON.stringify(metadata.before || {}),
+      after:       JSON.stringify(metadata.after  || {}),
+      ip_address:  req.ip || null,
+      created_at:  new Date(),
     })
   } catch (err) {
-    logger.error('Audit log failed', { action, err: err.message })
+    // Audit log failure should never crash the app
+    console.error('[AuditLog Error]', err.message)
   }
 }
 
