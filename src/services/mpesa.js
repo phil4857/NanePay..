@@ -1,6 +1,5 @@
-// src/services/mpesa.js
-
-const axios = require('axios')
+// src/services/mpesa.js  ← REPLACEMENT
+const axios  = require('axios')
 const logger = require('../config/logger')
 
 const MPESA_ENV = process.env.MPESA_ENV || 'sandbox'
@@ -11,7 +10,7 @@ const BASE_URL =
     : 'https://sandbox.safaricom.co.ke'
 
 // ─────────────────────────────────────────────────────────────
-// ENV VALIDATION
+// LAZY ENV VALIDATION — only runs when M-Pesa is actually used
 // ─────────────────────────────────────────────────────────────
 
 const REQUIRED_ENVS = [
@@ -19,12 +18,13 @@ const REQUIRED_ENVS = [
   'MPESA_CONSUMER_SECRET',
   'MPESA_SHORTCODE',
   'MPESA_PASSKEY',
-  'MPESA_CALLBACK_URL'
+  'MPESA_CALLBACK_URL',
 ]
 
-for (const key of REQUIRED_ENVS) {
-  if (!process.env[key]) {
-    throw new Error(`Missing required env variable: ${key}`)
+function validateEnv() {
+  const missing = REQUIRED_ENVS.filter(k => !process.env[k])
+  if (missing.length > 0) {
+    throw new Error(`Missing required M-Pesa env variables: ${missing.join(', ')}`)
   }
 }
 
@@ -38,15 +38,9 @@ function normalizePhone(phone) {
 
   const cleaned = String(phone).replace(/\D/g, '')
 
-  if (cleaned.startsWith('254')) return cleaned
-
-  if (cleaned.startsWith('0')) {
-    return `254${cleaned.slice(1)}`
-  }
-
-  if (cleaned.startsWith('7') || cleaned.startsWith('1')) {
-    return `254${cleaned}`
-  }
+  if (cleaned.startsWith('254'))                        return cleaned
+  if (cleaned.startsWith('0'))                          return `254${cleaned.slice(1)}`
+  if (cleaned.startsWith('7') || cleaned.startsWith('1')) return `254${cleaned}`
 
   return cleaned
 }
@@ -80,20 +74,16 @@ function generatePassword(timestamp) {
 // ─────────────────────────────────────────────────────────────
 
 async function getAccessToken() {
+  validateEnv()
+
   try {
     const credentials = Buffer
-      .from(
-        `${process.env.MPESA_CONSUMER_KEY}:${process.env.MPESA_CONSUMER_SECRET}`
-      )
+      .from(`${process.env.MPESA_CONSUMER_KEY}:${process.env.MPESA_CONSUMER_SECRET}`)
       .toString('base64')
 
     const response = await axios.get(
       `${BASE_URL}/oauth/v1/generate?grant_type=client_credentials`,
-      {
-        headers: {
-          Authorization: `Basic ${credentials}`
-        }
-      }
+      { headers: { Authorization: `Basic ${credentials}` } }
     )
 
     return response.data.access_token
@@ -101,9 +91,8 @@ async function getAccessToken() {
   } catch (err) {
     logger.error('Failed to get M-Pesa token', {
       error: err.message,
-      data: err.response?.data
+      data:  err.response?.data,
     })
-
     throw err
   }
 }
@@ -115,20 +104,20 @@ async function getAccessToken() {
 async function stkPush({
   phone,
   amount,
-  reference = 'NanePay',
+  reference   = 'NanePay',
   description = 'NanePay Payment',
-  type = 'buygoods' // buygoods | paybill
+  type        = 'buygoods', // buygoods | paybill
 }) {
+  validateEnv()
 
   try {
-    const token      = await getAccessToken()
-    const timestamp  = getTimestamp()
-    const password   = generatePassword(timestamp)
+    const token     = await getAccessToken()
+    const timestamp = getTimestamp()
+    const password  = generatePassword(timestamp)
 
     const normalizedPhone = normalizePhone(phone)
-
     if (!normalizedPhone || normalizedPhone.length !== 12) {
-      throw new Error('Invalid phone number')
+      throw new Error(`Invalid phone number: ${phone}`)
     }
 
     const transactionType =
@@ -150,31 +139,21 @@ async function stkPush({
       TransactionDesc:   String(description).slice(0, 50),
     }
 
-    logger.info('Initiating STK Push', {
-      phone: normalizedPhone,
-      amount,
-      reference
-    })
+    logger.info('Initiating STK Push', { phone: normalizedPhone, amount, reference })
 
     const response = await axios.post(
       `${BASE_URL}/mpesa/stkpush/v1/processrequest`,
       payload,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`
-        }
-      }
+      { headers: { Authorization: `Bearer ${token}` } }
     )
 
     return response.data
 
   } catch (err) {
-
     logger.error('STK Push Failed', {
       error: err.message,
-      data: err.response?.data
+      data:  err.response?.data,
     })
-
     throw err
   }
 }
@@ -184,38 +163,33 @@ async function stkPush({
 // ─────────────────────────────────────────────────────────────
 
 async function querySTKStatus(checkoutRequestId) {
+  validateEnv()
 
   try {
-    const token      = await getAccessToken()
-    const timestamp  = getTimestamp()
-    const password   = generatePassword(timestamp)
+    const token     = await getAccessToken()
+    const timestamp = getTimestamp()
+    const password  = generatePassword(timestamp)
 
     const payload = {
       BusinessShortCode: process.env.MPESA_SHORTCODE,
       Password:          password,
       Timestamp:         timestamp,
-      CheckoutRequestID: checkoutRequestId
+      CheckoutRequestID: checkoutRequestId,
     }
 
     const response = await axios.post(
       `${BASE_URL}/mpesa/stkpushquery/v1/query`,
       payload,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`
-        }
-      }
+      { headers: { Authorization: `Bearer ${token}` } }
     )
 
     return response.data
 
   } catch (err) {
-
     logger.error('STK Query Failed', {
       error: err.message,
-      data: err.response?.data
+      data:  err.response?.data,
     })
-
     throw err
   }
 }
@@ -227,14 +201,13 @@ async function querySTKStatus(checkoutRequestId) {
 async function b2cPayout({
   phone,
   amount,
-  remarks = 'NanePay Withdrawal',
-  occasion = 'Withdrawal'
+  remarks  = 'NanePay Withdrawal',
+  occasion = 'Withdrawal',
 }) {
+  validateEnv()
 
   try {
-
-    const token = await getAccessToken()
-
+    const token           = await getAccessToken()
     const normalizedPhone = normalizePhone(phone)
 
     const payload = {
@@ -250,30 +223,21 @@ async function b2cPayout({
       Occasion:           occasion,
     }
 
-    logger.info('Initiating B2C payout', {
-      phone: normalizedPhone,
-      amount
-    })
+    logger.info('Initiating B2C payout', { phone: normalizedPhone, amount })
 
     const response = await axios.post(
       `${BASE_URL}/mpesa/b2c/v1/paymentrequest`,
       payload,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`
-        }
-      }
+      { headers: { Authorization: `Bearer ${token}` } }
     )
 
     return response.data
 
   } catch (err) {
-
     logger.error('B2C payout failed', {
       error: err.message,
-      data: err.response?.data
+      data:  err.response?.data,
     })
-
     throw err
   }
 }
@@ -287,5 +251,5 @@ module.exports = {
   querySTKStatus,
   b2cPayout,
   normalizePhone,
-  getAccessToken
+  getAccessToken,
 }
