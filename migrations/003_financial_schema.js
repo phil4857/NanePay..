@@ -2,16 +2,31 @@
 
 exports.up = async knex => {
 
-  // ── Wallets (upgrade) ─────────────────────────────────────────
-  await knex.schema.createTable('wallets', t => {
-    t.uuid('id').primary()
-    t.uuid('user_id').references('id').inTable('users').onDelete('CASCADE').unique()
-    t.decimal('available_balance', 14, 2).defaultTo(0).notNullable()
-    t.decimal('locked_balance',    14, 2).defaultTo(0).notNullable()
-    t.decimal('total_balance',     14, 2).defaultTo(0).notNullable()
-    t.string('currency', 3).defaultTo('KES')
-    t.timestamps(true, true)
+  // ── Wallets (upgrade existing table) ──────────────────────────
+
+const hasLockedBalance = await knex.schema.hasColumn('wallets', 'locked_balance')
+
+if (!hasLockedBalance) {
+  await knex.schema.alterTable('wallets', t => {
+    t.decimal('locked_balance', 14, 2).defaultTo(0).notNullable()
   })
+}
+
+const hasTotalBalance = await knex.schema.hasColumn('wallets', 'total_balance')
+
+if (!hasTotalBalance) {
+  await knex.schema.alterTable('wallets', t => {
+    t.decimal('total_balance', 14, 2).defaultTo(0).notNullable()
+  })
+}
+
+const hasCurrency = await knex.schema.hasColumn('wallets', 'currency')
+
+if (!hasCurrency) {
+  await knex.schema.alterTable('wallets', t => {
+    t.string('currency', 3).defaultTo('KES')
+  })
+}
 
   // ── Ledger (heart of the system) ─────────────────────────────
   await knex.schema.createTable('ledger', t => {
