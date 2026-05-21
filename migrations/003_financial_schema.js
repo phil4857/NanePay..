@@ -2,43 +2,50 @@
 
 exports.up = async function (knex) {
 
-  // ── Enable pgcrypto extension ────────────────────────────────
+  // ── Enable pgcrypto ──────────────────────────────────────────
   await knex.raw('CREATE EXTENSION IF NOT EXISTS "pgcrypto"')
 
   // ─────────────────────────────────────────────────────────────
   // WALLETS UPGRADE
   // ─────────────────────────────────────────────────────────────
 
-  const hasAvailableBalance = await knex.schema.hasColumn('wallets', 'available_balance')
+  const hasAvailableBalance =
+    await knex.schema.hasColumn('wallets', 'available_balance')
 
   if (!hasAvailableBalance) {
     await knex.schema.alterTable('wallets', (t) => {
-      t.decimal('available_balance', 14, 2).defaultTo(0).notNullable()
+      t.decimal('available_balance', 14, 2)
+        .defaultTo(0)
+        .notNullable()
     })
 
-    // migrate old balance
     await knex.raw(`
       UPDATE wallets
       SET available_balance = balance
     `)
   }
 
-  const hasLockedBalance = await knex.schema.hasColumn('wallets', 'locked_balance')
+  const hasLockedBalance =
+    await knex.schema.hasColumn('wallets', 'locked_balance')
 
   if (!hasLockedBalance) {
     await knex.schema.alterTable('wallets', (t) => {
-      t.decimal('locked_balance', 14, 2).defaultTo(0).notNullable()
+      t.decimal('locked_balance', 14, 2)
+        .defaultTo(0)
+        .notNullable()
     })
   }
 
-  const hasTotalBalance = await knex.schema.hasColumn('wallets', 'total_balance')
+  const hasTotalBalance =
+    await knex.schema.hasColumn('wallets', 'total_balance')
 
   if (!hasTotalBalance) {
     await knex.schema.alterTable('wallets', (t) => {
-      t.decimal('total_balance', 14, 2).defaultTo(0).notNullable()
+      t.decimal('total_balance', 14, 2)
+        .defaultTo(0)
+        .notNullable()
     })
 
-    // migrate old balance
     await knex.raw(`
       UPDATE wallets
       SET total_balance = balance
@@ -49,7 +56,8 @@ exports.up = async function (knex) {
   // TRANSACTIONS UPGRADE
   // ─────────────────────────────────────────────────────────────
 
-  const hasCheckoutRequestId = await knex.schema.hasColumn('transactions', 'checkout_request_id')
+  const hasCheckoutRequestId =
+    await knex.schema.hasColumn('transactions', 'checkout_request_id')
 
   if (!hasCheckoutRequestId) {
     await knex.schema.alterTable('transactions', (t) => {
@@ -57,7 +65,8 @@ exports.up = async function (knex) {
     })
   }
 
-  const hasMerchantRequestId = await knex.schema.hasColumn('transactions', 'merchant_request_id')
+  const hasMerchantRequestId =
+    await knex.schema.hasColumn('transactions', 'merchant_request_id')
 
   if (!hasMerchantRequestId) {
     await knex.schema.alterTable('transactions', (t) => {
@@ -66,14 +75,17 @@ exports.up = async function (knex) {
   }
 
   // ─────────────────────────────────────────────────────────────
-  // LEDGER TABLE
+  // LEDGER
   // ─────────────────────────────────────────────────────────────
 
   const hasLedger = await knex.schema.hasTable('ledger')
 
   if (!hasLedger) {
     await knex.schema.createTable('ledger', (t) => {
-      t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'))
+
+      t.uuid('id')
+        .primary()
+        .defaultTo(knex.raw('gen_random_uuid()'))
 
       t.uuid('user_id')
         .references('id')
@@ -92,25 +104,32 @@ exports.up = async function (knex) {
         'withdrawal',
         'transfer_in',
         'transfer_out',
+        'service_payment',
         'wifi_purchase',
-        'wifi_refund',
         'fee',
         'commission',
         'merchant_credit',
         'merchant_debit',
         'platform_fee',
+        'refund',
         'reversal'
       ]).notNullable()
 
       t.decimal('amount', 14, 2).notNullable()
+
       t.decimal('balance_before', 14, 2).notNullable()
+
       t.decimal('balance_after', 14, 2).notNullable()
 
       t.string('reference').unique().notNullable()
 
-      t.uuid('transaction_id').nullable()
+      t.uuid('transaction_id')
+        .references('id')
+        .inTable('transactions')
+        .onDelete('SET NULL')
+        .nullable()
 
-      t.text('description')
+      t.text('description').nullable()
 
       t.enum('status', [
         'pending',
@@ -129,13 +148,21 @@ exports.up = async function (knex) {
   // PLATFORM REVENUE
   // ─────────────────────────────────────────────────────────────
 
-  const hasPlatformRevenue = await knex.schema.hasTable('platform_revenue')
+  const hasPlatformRevenue =
+    await knex.schema.hasTable('platform_revenue')
 
   if (!hasPlatformRevenue) {
     await knex.schema.createTable('platform_revenue', (t) => {
-      t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'))
 
-      t.uuid('transaction_id').nullable()
+      t.uuid('id')
+        .primary()
+        .defaultTo(knex.raw('gen_random_uuid()'))
+
+      t.uuid('transaction_id')
+        .references('id')
+        .inTable('transactions')
+        .onDelete('SET NULL')
+        .nullable()
 
       t.uuid('ledger_id')
         .references('id')
@@ -145,16 +172,18 @@ exports.up = async function (knex) {
 
       t.enum('source', [
         'transfer_fee',
-        'wifi_purchase_fee',
+        'wifi_fee',
         'withdrawal_fee',
         'merchant_fee',
         'subscription_fee',
+        'service_fee',
         'other'
       ]).notNullable()
 
       t.decimal('amount', 14, 2).notNullable()
 
-      t.decimal('fee_rate', 5, 4).defaultTo(0.01)
+      t.decimal('fee_rate', 5, 4)
+        .defaultTo(0.01)
 
       t.uuid('payer_id')
         .references('id')
@@ -162,7 +191,7 @@ exports.up = async function (knex) {
         .onDelete('SET NULL')
         .nullable()
 
-      t.text('description')
+      t.text('description').nullable()
 
       t.timestamps(true, true)
     })
@@ -172,11 +201,15 @@ exports.up = async function (knex) {
   // MERCHANT WALLETS
   // ─────────────────────────────────────────────────────────────
 
-  const hasMerchantWallets = await knex.schema.hasTable('merchant_wallets')
+  const hasMerchantWallets =
+    await knex.schema.hasTable('merchant_wallets')
 
   if (!hasMerchantWallets) {
     await knex.schema.createTable('merchant_wallets', (t) => {
-      t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'))
+
+      t.uuid('id')
+        .primary()
+        .defaultTo(knex.raw('gen_random_uuid()'))
 
       t.uuid('merchant_id')
         .references('id')
@@ -184,258 +217,457 @@ exports.up = async function (knex) {
         .onDelete('CASCADE')
         .unique()
 
-      t.decimal('balance', 14, 2).defaultTo(0)
-      t.decimal('total_earnings', 14, 2).defaultTo(0)
-      t.decimal('pending_withdrawal', 14, 2).defaultTo(0)
-      t.decimal('total_withdrawn', 14, 2).defaultTo(0)
+      t.decimal('balance', 14, 2)
+        .defaultTo(0)
 
-      t.string('currency', 3).defaultTo('KES')
+      t.decimal('pending_balance', 14, 2)
+        .defaultTo(0)
+
+      t.decimal('total_earnings', 14, 2)
+        .defaultTo(0)
+
+      t.decimal('total_withdrawn', 14, 2)
+        .defaultTo(0)
+
+      t.string('currency', 3)
+        .defaultTo('KES')
 
       t.timestamps(true, true)
     })
   }
 
   // ─────────────────────────────────────────────────────────────
-  // WIFI OFFERS
+  // PACKAGES
   // ─────────────────────────────────────────────────────────────
 
-  const hasWifiOffers = await knex.schema.hasTable('wifi_offers')
+  const hasPackages =
+    await knex.schema.hasTable('packages')
 
-  if (!hasWifiOffers) {
-    await knex.schema.createTable('wifi_offers', (t) => {
-      t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'))
+  if (!hasPackages) {
+    await knex.schema.createTable('packages', (t) => {
+
+      t.uuid('id')
+        .primary()
+        .defaultTo(knex.raw('gen_random_uuid()'))
 
       t.uuid('merchant_id')
+        .nullable()
         .references('id')
         .inTable('merchant_profiles')
         .onDelete('CASCADE')
 
-      t.string('name').notNullable()
+      t.string('name', 100).notNullable()
+
+      t.text('description').nullable()
+
+      t.enum('category', [
+        'WIFI',
+        'ELECTRICITY',
+        'WATER',
+        'SCHOOL',
+        'RENT',
+        'CUSTOM'
+      ]).defaultTo('WIFI')
 
       t.enum('duration_type', [
-        'hourly',
-        'midnight',
-        'daily',
-        'weekly',
-        'monthly'
+        'MINUTES',
+        'HOURS',
+        'DAYS',
+        'MONTHS'
       ]).notNullable()
 
-      t.integer('duration_hours').notNullable()
+      t.integer('duration_value').notNullable()
 
-      t.decimal('price', 14, 2).notNullable()
+      t.decimal('price', 15, 2).notNullable()
 
-      t.string('speed_profile').defaultTo('5Mbps')
+      t.string('speed_profile', 50).nullable()
 
-      t.integer('max_devices').defaultTo(1)
+      t.integer('device_limit').defaultTo(1)
 
-      t.boolean('active').defaultTo(true)
+      t.boolean('is_active').defaultTo(true)
 
-      t.integer('purchase_count').defaultTo(0)
+      t.jsonb('metadata').nullable()
 
-      t.timestamps(true, true)
+      t.timestamp('created_at')
+        .defaultTo(knex.fn.now())
     })
   }
 
   // ─────────────────────────────────────────────────────────────
-  // WIFI PURCHASES
+  // SUBSCRIPTIONS
   // ─────────────────────────────────────────────────────────────
 
-  const hasWifiPurchases = await knex.schema.hasTable('wifi_purchases')
+  const hasSubscriptions =
+    await knex.schema.hasTable('subscriptions')
 
-  if (!hasWifiPurchases) {
-    await knex.schema.createTable('wifi_purchases', (t) => {
-      t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'))
+  if (!hasSubscriptions) {
+    await knex.schema.createTable('subscriptions', (t) => {
 
-      t.uuid('customer_id')
+      t.uuid('id')
+        .primary()
+        .defaultTo(knex.raw('gen_random_uuid()'))
+
+      t.uuid('user_id')
+        .notNullable()
         .references('id')
         .inTable('users')
-        .onDelete('SET NULL')
-        .nullable()
+        .onDelete('CASCADE')
+
+      t.uuid('package_id')
+        .notNullable()
+        .references('id')
+        .inTable('packages')
 
       t.uuid('merchant_id')
+        .notNullable()
         .references('id')
         .inTable('merchant_profiles')
-        .onDelete('SET NULL')
-        .nullable()
-
-      t.uuid('offer_id')
-        .references('id')
-        .inTable('wifi_offers')
-        .onDelete('SET NULL')
-        .nullable()
 
       t.uuid('transaction_id')
+        .nullable()
         .references('id')
         .inTable('transactions')
-        .onDelete('SET NULL')
-        .nullable()
-
-      t.decimal('amount', 14, 2).notNullable()
-      t.decimal('fee', 14, 2).defaultTo(0)
-      t.decimal('merchant_credit', 14, 2).notNullable()
 
       t.enum('status', [
-        'pending',
-        'active',
-        'expired',
-        'cancelled',
-        'refunded'
-      ]).defaultTo('pending')
+        'PENDING',
+        'ACTIVE',
+        'EXPIRED',
+        'CANCELLED',
+        'SUSPENDED'
+      ]).defaultTo('PENDING')
+
+      t.string('account_reference', 100).nullable()
 
       t.timestamp('activated_at').nullable()
-      t.timestamp('expiry_time').nullable()
 
-      t.string('checkout_request_id').nullable()
+      t.timestamp('expires_at').nullable()
 
-      t.timestamps(true, true)
+      t.integer('devices_connected')
+        .defaultTo(0)
+
+      t.jsonb('metadata').nullable()
+
+      t.timestamp('created_at')
+        .defaultTo(knex.fn.now())
     })
   }
 
   // ─────────────────────────────────────────────────────────────
-  // WIFI SESSIONS
+  // HOTSPOT SESSIONS
   // ─────────────────────────────────────────────────────────────
 
-  const hasWifiSessions = await knex.schema.hasTable('wifi_sessions')
+  const hasHotspotSessions =
+    await knex.schema.hasTable('hotspot_sessions')
 
-  if (!hasWifiSessions) {
-    await knex.schema.createTable('wifi_sessions', (t) => {
-      t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'))
+  if (!hasHotspotSessions) {
+    await knex.schema.createTable('hotspot_sessions', (t) => {
 
-      t.uuid('purchase_id')
+      t.uuid('id')
+        .primary()
+        .defaultTo(knex.raw('gen_random_uuid()'))
+
+      t.uuid('subscription_id')
+        .notNullable()
         .references('id')
-        .inTable('wifi_purchases')
+        .inTable('subscriptions')
         .onDelete('CASCADE')
 
       t.uuid('user_id')
+        .notNullable()
         .references('id')
         .inTable('users')
-        .onDelete('SET NULL')
-        .nullable()
+        .onDelete('CASCADE')
 
-      t.string('device_mac').nullable()
-      t.string('device_ip').nullable()
+      t.string('mac_address', 20).nullable()
 
-      t.string('username').nullable()
+      t.string('ip_address', 45).nullable()
 
-      t.timestamp('start_time').notNullable()
-      t.timestamp('expiry_time').notNullable()
+      t.string('device_name', 100).nullable()
+
+      t.bigInteger('bytes_uploaded')
+        .defaultTo(0)
+
+      t.bigInteger('bytes_downloaded')
+        .defaultTo(0)
 
       t.enum('status', [
-        'active',
-        'expired',
-        'disconnected',
-        'blocked'
-      ]).defaultTo('active')
+        'ACTIVE',
+        'DISCONNECTED',
+        'EXPIRED'
+      ]).defaultTo('ACTIVE')
 
-      t.integer('device_count').defaultTo(0)
+      t.timestamp('started_at')
+        .defaultTo(knex.fn.now())
 
-      t.bigInteger('bytes_up').defaultTo(0)
-      t.bigInteger('bytes_down').defaultTo(0)
-
-      t.timestamps(true, true)
+      t.timestamp('ended_at').nullable()
     })
   }
 
   // ─────────────────────────────────────────────────────────────
-  // WITHDRAWALS
+  // ROUTERS
   // ─────────────────────────────────────────────────────────────
 
-  const hasWithdrawals = await knex.schema.hasTable('withdrawals')
+  const hasRouters =
+    await knex.schema.hasTable('routers')
 
-  if (!hasWithdrawals) {
-    await knex.schema.createTable('withdrawals', (t) => {
-      t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'))
+  if (!hasRouters) {
+    await knex.schema.createTable('routers', (t) => {
 
-      t.uuid('user_id')
-        .references('id')
-        .inTable('users')
-        .onDelete('SET NULL')
-        .nullable()
+      t.uuid('id')
+        .primary()
+        .defaultTo(knex.raw('gen_random_uuid()'))
 
       t.uuid('merchant_id')
+        .notNullable()
         .references('id')
         .inTable('merchant_profiles')
-        .onDelete('SET NULL')
-        .nullable()
+        .onDelete('CASCADE')
 
-      t.decimal('amount', 14, 2).notNullable()
-      t.decimal('fee', 14, 2).defaultTo(0)
-      t.decimal('net_amount', 14, 2).notNullable()
+      t.string('name', 100).notNullable()
+
+      t.enum('type', [
+        'MIKROTIK',
+        'OPENWRT',
+        'RADIUS',
+        'CUSTOM'
+      ]).defaultTo('MIKROTIK')
+
+      t.string('ip_address', 45).nullable()
+
+      t.integer('port')
+        .defaultTo(8728)
+
+      t.string('username', 100).nullable()
+
+      t.string('password_encrypted', 255).nullable()
+
+      t.string('api_endpoint', 255).nullable()
+
+      t.string('api_key_router', 255).nullable()
+
+      t.boolean('is_online')
+        .defaultTo(false)
+
+      t.timestamp('last_seen').nullable()
+
+      t.jsonb('config').nullable()
+
+      t.timestamp('created_at')
+        .defaultTo(knex.fn.now())
+    })
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // COMMISSIONS
+  // ─────────────────────────────────────────────────────────────
+
+  const hasCommissions =
+    await knex.schema.hasTable('commissions')
+
+  if (!hasCommissions) {
+    await knex.schema.createTable('commissions', (t) => {
+
+      t.uuid('id')
+        .primary()
+        .defaultTo(knex.raw('gen_random_uuid()'))
+
+      t.uuid('merchant_id')
+        .notNullable()
+        .references('id')
+        .inTable('merchant_profiles')
+        .onDelete('CASCADE')
+
+      t.uuid('transaction_id')
+        .notNullable()
+        .references('id')
+        .inTable('transactions')
+
+      t.decimal('transaction_amount', 15, 2)
+        .notNullable()
+
+      t.decimal('commission_rate', 5, 4)
+        .notNullable()
+
+      t.decimal('commission_amount', 15, 2)
+        .notNullable()
+
+      t.decimal('nanepay_fee', 15, 2)
+        .notNullable()
+
+      t.decimal('merchant_payout', 15, 2)
+        .notNullable()
 
       t.enum('status', [
-        'pending',
-        'approved',
-        'processing',
-        'paid',
-        'rejected',
-        'failed'
-      ]).defaultTo('pending')
+        'PENDING',
+        'PAID',
+        'HELD'
+      ]).defaultTo('PENDING')
 
-      t.enum('method', ['mpesa', 'bank']).defaultTo('mpesa')
+      t.timestamp('created_at')
+        .defaultTo(knex.fn.now())
+    })
+  }
 
-      t.string('phone_number').nullable()
-      t.string('mpesa_receipt').nullable()
+  // ─────────────────────────────────────────────────────────────
+  // PASSWORD RESETS
+  // ─────────────────────────────────────────────────────────────
 
-      t.uuid('approved_by')
+  const hasPasswordResets =
+    await knex.schema.hasTable('password_resets')
+
+  if (!hasPasswordResets) {
+    await knex.schema.createTable('password_resets', (t) => {
+
+      t.bigIncrements('id')
+
+      t.uuid('user_id')
+        .notNullable()
         .references('id')
         .inTable('users')
-        .onDelete('SET NULL')
-        .nullable()
+        .onDelete('CASCADE')
 
-      t.timestamp('approved_at').nullable()
+      t.string('token', 100)
+        .unique()
+        .notNullable()
+
+      t.boolean('used')
+        .defaultTo(false)
+
+      t.timestamp('expires_at')
+        .notNullable()
+
+      t.timestamp('created_at')
+        .defaultTo(knex.fn.now())
+    })
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // MERCHANT RATINGS
+  // ─────────────────────────────────────────────────────────────
+
+  const hasMerchantRatings =
+    await knex.schema.hasTable('merchant_ratings')
+
+  if (!hasMerchantRatings) {
+    await knex.schema.createTable('merchant_ratings', (t) => {
+
+      t.uuid('id')
+        .primary()
+        .defaultTo(knex.raw('gen_random_uuid()'))
+
+      t.uuid('merchant_id')
+        .notNullable()
+        .references('id')
+        .inTable('merchant_profiles')
+        .onDelete('CASCADE')
+
+      t.uuid('user_id')
+        .notNullable()
+        .references('id')
+        .inTable('users')
+        .onDelete('CASCADE')
+
+      t.integer('rating').notNullable()
+
+      t.text('review').nullable()
+
+      t.timestamp('created_at')
+        .defaultTo(knex.fn.now())
+    })
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // MERCHANT PROFILE UPGRADES
+  // ─────────────────────────────────────────────────────────────
+
+  const hasMerchantStatus =
+    await knex.schema.hasColumn('merchant_profiles', 'status')
+
+  if (!hasMerchantStatus) {
+    await knex.schema.alterTable('merchant_profiles', (t) => {
+
+      t.string('status', 20)
+        .defaultTo('PENDING')
 
       t.text('rejection_reason').nullable()
 
-      t.timestamps(true, true)
+      t.decimal('wallet_balance', 15, 2)
+        .defaultTo(0)
+
+      t.string('business_logo', 500).nullable()
+
+      t.text('business_description').nullable()
+
+      t.string('website', 255).nullable()
+
+      t.decimal('avg_rating', 3, 2)
+        .defaultTo(0)
+
+      t.integer('total_ratings')
+        .defaultTo(0)
     })
   }
 
   // ─────────────────────────────────────────────────────────────
-  // NOTIFICATIONS
+  // USER UPGRADES
   // ─────────────────────────────────────────────────────────────
 
-  const hasNotifications = await knex.schema.hasTable('notifications')
+  const hasEmailVerified =
+    await knex.schema.hasColumn('users', 'email_verified')
 
-  if (!hasNotifications) {
-    await knex.schema.createTable('notifications', (t) => {
-      t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'))
+  if (!hasEmailVerified) {
+    await knex.schema.alterTable('users', (t) => {
 
-      t.uuid('user_id')
-        .references('id')
-        .inTable('users')
-        .onDelete('CASCADE')
+      t.boolean('email_verified')
+        .defaultTo(false)
 
-      t.string('title').notNullable()
+      t.boolean('phone_verified')
+        .defaultTo(false)
 
-      t.text('body').notNullable()
-
-      t.enum('type', [
-        'info',
-        'success',
-        'warning',
-        'error',
-        'payment',
-        'wifi'
-      ]).defaultTo('info')
-
-      t.boolean('read').defaultTo(false)
-
-      t.jsonb('data').defaultTo('{}')
-
-      t.timestamps(true, true)
+      t.string('avatar', 500).nullable()
     })
   }
+
+  // ─────────────────────────────────────────────────────────────
+  // INDEXES
+  // ─────────────────────────────────────────────────────────────
+
+  await knex.raw(`
+    CREATE INDEX IF NOT EXISTS idx_subscriptions_user
+    ON subscriptions(user_id)
+  `)
+
+  await knex.raw(`
+    CREATE INDEX IF NOT EXISTS idx_subscriptions_status
+    ON subscriptions(status)
+  `)
+
+  await knex.raw(`
+    CREATE INDEX IF NOT EXISTS idx_notifications_user
+    ON notifications(user_id)
+  `)
+
+  await knex.raw(`
+    CREATE INDEX IF NOT EXISTS idx_hotspot_subscription
+    ON hotspot_sessions(subscription_id)
+  `)
+
+  await knex.raw(`
+    CREATE INDEX IF NOT EXISTS idx_transactions_checkout
+    ON transactions(checkout_request_id)
+  `)
 }
 
 exports.down = async function (knex) {
 
-  await knex.schema.dropTableIfExists('notifications')
-  await knex.schema.dropTableIfExists('withdrawals')
-  await knex.schema.dropTableIfExists('wifi_sessions')
-  await knex.schema.dropTableIfExists('wifi_purchases')
-  await knex.schema.dropTableIfExists('wifi_offers')
+  await knex.schema.dropTableIfExists('merchant_ratings')
+  await knex.schema.dropTableIfExists('password_resets')
+  await knex.schema.dropTableIfExists('commissions')
+  await knex.schema.dropTableIfExists('routers')
+  await knex.schema.dropTableIfExists('hotspot_sessions')
+  await knex.schema.dropTableIfExists('subscriptions')
+  await knex.schema.dropTableIfExists('packages')
   await knex.schema.dropTableIfExists('merchant_wallets')
   await knex.schema.dropTableIfExists('platform_revenue')
   await knex.schema.dropTableIfExists('ledger')
-
 }
