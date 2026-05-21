@@ -1,26 +1,24 @@
+// src/routes/forex.js  ← REPLACEMENT
 const express = require('express')
 const axios   = require('axios')
-const db      = require('../config/database')
+const db      = require('../db')
 const logger  = require('../config/logger')
-const { authenticate, requireActive } = require('../middleware/auth')
-const { validate, rules }             = require('../middleware/validate')
-const { auditLog }                    = require('../middleware/audit')
-const { generateTxRef, FEES }         = require('../utils/helpers')
+const { authenticate, requireRole } = require('../middleware/auth')
 
 const router = express.Router()
 
-// ── LIVE RATES CACHE ─────────────────────────────────────────
-// Rates cached for 1 hour to avoid hitting API limits
+// ── FEES ─────────────────────────────────────────────────────
+const FOREX_MARKUP = parseFloat(process.env.FOREX_MARKUP || '0.02') // 2%
+
+// ── LIVE RATES CACHE ──────────────────────────────────────────
 let ratesCache = null
 let cacheTime  = null
 const CACHE_TTL = 60 * 60 * 1000 // 1 hour
 
 const fetchLiveRates = async () => {
   try {
-    // Using ExchangeRate-API free tier (1500 requests/month free)
-    // Sign up at: https://www.exchangerate-api.com
     const apiKey = process.env.EXCHANGE_RATE_API_KEY
-    
+
     if (!apiKey) {
       // Fallback mock rates if no API key configured
       return {
@@ -31,7 +29,7 @@ const fetchLiveRates = async () => {
         UGX: 0.0338,
         ZAR: 7.12,
         NGN: 0.089,
-        source: 'mock',
+        source:     'mock',
         updated_at: new Date().toISOString(),
       }
     }
@@ -50,7 +48,7 @@ const fetchLiveRates = async () => {
       UGX: parseFloat((1 / rates.UGX).toFixed(6)),
       ZAR: parseFloat((1 / rates.ZAR).toFixed(4)),
       NGN: parseFloat((1 / rates.NGN).toFixed(6)),
-      source: 'live',
+      source:     'live',
       updated_at: new Date().toISOString(),
     }
   } catch (err) {
@@ -72,9 +70,9 @@ const getRates = async () => {
   return ratesCache
 }
 
-const applyMarkup = (midRate, markup = FEES.FOREX_MARKUP) => ({
-  buy_rate:  parseFloat((midRate * (1 + markup)).toFixed(4)),
-  sell_rate: parseFloat((midRate * (1 - markup)).toFixed(4)),
+const applyMarkup = (midRate) => ({
+  buy_rate:  parseFloat((midRate * (1 + FOREX_MARKUP)).toFixed(4)),
+  sell_rate: parseFloat((midRate * (1 - FOREX_MARKUP)).toFixed(4)),
   mid_rate:  midRate,
 })
 
@@ -99,10 +97,10 @@ router.get('/rates', authenticate, async (req, res) => {
     const rates = currencies.map(c => ({
       ...c,
       ...applyMarkup(midRates[c.code]),
-      markup_pct:  FEES.FOREX_MARKUP * 100,
+      markup_pct: FOREX_MARKUP * 100,
     }))
 
-    res.json({
+    return res.json({
       rates,
       source:     midRates.source,
       updated_at: midRates.updated_at,
@@ -110,99 +108,124 @@ router.get('/rates', authenticate, async (req, res) => {
     })
   } catch (err) {
     logger.error('Get rates failed', { err: err.message })
-    res.status(500).json({ error: 'Failed to fetch rates' })
+    return res.status(500).json({ error: 'Failed to fetch rates' })
   }
 })
 
 // ── POST /api/forex/exchange ──────────────────────────────────
-router.post('/exchange',
-  authenticate, requireActive,
-  rules.forex, validate,
-  async (req, res) => {
-    const userId    = req.user.userId
-    const { currency, direction } = req.body
-    const amount    = parseFloat(req.body.amount)
+router.post('/exchange', authenticate, async (req, res) => {
+  const { currency, direction } = req.body
+  const amount = parseFloat(req.body.amount)
 
-    try {
-      const midRates = await getRates()
-      if (!midRates) return res.status(503).json({ error: 'Rates unavailable. Try again.' })
-
-      const midRate = midRates[currency]
-      if (!midRate) return res.status(400).json({ error: 'Unsupported currency' })
-
-      const { buy_rate, sell_rate } = applyMarkup(midRate)
-
-      let kesAmount, foreignAmount, nanepay_margin
-
-      if (direction === 'buy') {
-        foreignAmount  = amount
-        kesAmount      = parseFloat((amount * buy_rate).toFixed(2))
-        nanepay_margin = parseFloat((amount * (buy_rate - midRate)).toFixed(2))
-      } else {
-        foreignAmount  = amount
-        kesAmount      = parseFloat((amount * sell_rate).toFixed(2))
-        nanepay_margin = parseFloat((amount * (midRate - sell_rate)).toFixed(2))
-      }
-
-      await db.transaction(async (trx) => {
-        const wallet = await trx('wallets')
-          .where({ user_id: userId }).forUpdate().first()
-
-        if (direction === 'buy' && parseFloat(wallet.balance) < kesAmount) {
-          throw new Error('INSUFFICIENT_BALANCE')
-        }
-
-        if (direction === 'buy') {
-          await trx('wallets').where({ user_id: userId })
-            .decrement('balance', kesAmount).update({ updated_at: new Date() })
-        } else {
-          await trx('wallets').where({ user_id: userId })
-            .increment('balance', kesAmount).update({ updated_at: new Date() })
-        }
-
-        const reference = generateTxRef()
-
-        await trx('transactions').insert({
-          sender_id:      direction === 'buy'  ? userId : null,
-          receiver_id:    direction === 'sell' ? userId : null,
-          amount:         kesAmount,
-          fee:            nanepay_margin,
-          net_amount:     kesAmount,
-          type:           direction === 'buy' ? 'FOREX_BUY' : 'FOREX_SELL',
-          status:         'SUCCESSFUL',
-          reference,
-          forex_rate:     direction === 'buy' ? buy_rate : sell_rate,
-          forex_currency: currency,
-          description:    `${direction === 'buy' ? 'Bought' : 'Sold'} ${foreignAmount} ${currency} @ ${direction === 'buy' ? buy_rate : sell_rate}`,
-          created_at:     new Date(),
-        })
-
-        await trx('fee_ledger').insert({
-          amount:     nanepay_margin,
-          type:       'FOREX_MARGIN',
-          created_at: new Date(),
-        })
-      })
-
-      await auditLog(req, 'FOREX_EXCHANGE', { currency, direction, amount, kesAmount })
-
-      res.json({
-        message:        'Exchange successful',
-        direction,
-        currency,
-        foreign_amount: foreignAmount,
-        kes_amount:     kesAmount,
-        rate_used:      direction === 'buy' ? buy_rate : sell_rate,
-        nanepay_margin,
-      })
-    } catch (err) {
-      if (err.message === 'INSUFFICIENT_BALANCE') {
-        return res.status(400).json({ error: 'Insufficient KES balance' })
-      }
-      logger.error('Forex exchange failed', { err: err.message })
-      res.status(500).json({ error: 'Exchange failed. Please try again.' })
-    }
+  if (!currency || !direction || !amount || amount <= 0) {
+    return res.status(400).json({ error: 'currency, direction, and amount are required' })
   }
-)
+  if (!['buy', 'sell'].includes(direction)) {
+    return res.status(400).json({ error: 'direction must be buy or sell' })
+  }
+
+  try {
+    const midRates = await getRates()
+    if (!midRates) {
+      return res.status(503).json({ error: 'Rates unavailable. Try again.' })
+    }
+
+    const midRate = midRates[currency]
+    if (!midRate) {
+      return res.status(400).json({ error: `Unsupported currency: ${currency}` })
+    }
+
+    const { buy_rate, sell_rate } = applyMarkup(midRate)
+
+    let kesAmount, foreignAmount, margin
+
+    if (direction === 'buy') {
+      foreignAmount = amount
+      kesAmount     = parseFloat((amount * buy_rate).toFixed(2))
+      margin        = parseFloat((amount * (buy_rate - midRate)).toFixed(2))
+    } else {
+      foreignAmount = amount
+      kesAmount     = parseFloat((amount * sell_rate).toFixed(2))
+      margin        = parseFloat((amount * (midRate - sell_rate)).toFixed(2))
+    }
+
+    await db.transaction(async trx => {
+      // Lock wallet
+      const wallet = await trx('wallets')
+        .where({ user_id: req.user.id })
+        .forUpdate()
+        .first()
+
+      if (!wallet) throw new Error('WALLET_NOT_FOUND')
+
+      if (direction === 'buy' && parseFloat(wallet.available_balance) < kesAmount) {
+        throw new Error('INSUFFICIENT_BALANCE')
+      }
+
+      // Update wallet
+      if (direction === 'buy') {
+        await trx('wallets').where({ user_id: req.user.id })
+          .decrement('available_balance', kesAmount)
+          .decrement('total_balance',     kesAmount)
+      } else {
+        await trx('wallets').where({ user_id: req.user.id })
+          .increment('available_balance', kesAmount)
+          .increment('total_balance',     kesAmount)
+      }
+      await trx('wallets').where({ user_id: req.user.id }).update({ updated_at: new Date() })
+
+      // Record transaction
+      const { v4: uuid } = require('uuid')
+      const ref = `FX-${uuid().split('-')[0].toUpperCase()}`
+
+      await trx('transactions').insert({
+        id:          uuid(),
+        user_id:     req.user.id,
+        type:        direction === 'buy' ? 'forex_buy' : 'forex_sell',
+        amount:      kesAmount,
+        fee:         margin,
+        net_amount:  kesAmount,
+        status:      'completed',
+        reference:   ref,
+        description: `${direction === 'buy' ? 'Bought' : 'Sold'} ${foreignAmount} ${currency} @ ${direction === 'buy' ? buy_rate : sell_rate}`,
+        metadata:    JSON.stringify({ currency, direction, foreign_amount: foreignAmount, rate: direction === 'buy' ? buy_rate : sell_rate }),
+        created_at:  new Date(),
+        updated_at:  new Date(),
+      })
+
+      // Platform revenue
+      await trx('platform_revenue').insert({
+        id:          uuid(),
+        source:      'merchant_fee',
+        amount:      margin,
+        fee_rate:    FOREX_MARKUP,
+        payer_id:    req.user.id,
+        description: `Forex margin — ${direction} ${foreignAmount} ${currency}`,
+        created_at:  new Date(),
+        updated_at:  new Date(),
+      })
+    })
+
+    return res.json({
+      message:        'Exchange successful',
+      direction,
+      currency,
+      foreign_amount: foreignAmount,
+      kes_amount:     kesAmount,
+      rate_used:      direction === 'buy' ? buy_rate : sell_rate,
+      margin,
+    })
+
+  } catch (err) {
+    if (err.message === 'INSUFFICIENT_BALANCE') {
+      return res.status(400).json({ error: 'Insufficient KES balance' })
+    }
+    if (err.message === 'WALLET_NOT_FOUND') {
+      return res.status(404).json({ error: 'Wallet not found' })
+    }
+    logger.error('Forex exchange failed', { err: err.message })
+    return res.status(500).json({ error: 'Exchange failed. Please try again.' })
+  }
+})
 
 module.exports = router
