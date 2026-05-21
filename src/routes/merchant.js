@@ -1,95 +1,109 @@
+// src/routes/merchants.js  ← NEW FILE
 const express = require('express')
-const db      = require('../config/database')
-const logger  = require('../config/logger')
-const { v4: uuidv4 } = require('uuid')
-const { authenticate, requireActive } = require('../middleware/auth')
-const { validate, rules }             = require('../middleware/validate')
-const { auditLog }                    = require('../middleware/audit')
-const { generateTxRef, calcFee }      = require('../utils/helpers')
+const { v4: uuid } = require('uuid')
+const db      = require('../db')
+const { authenticate, requireRole } = require('../middleware/auth')
 
 const router = express.Router()
-router.use(authenticate, requireActive)
 
-router.post('/register', rules.merchantRegister, validate, async (req, res) => {
-  const userId = req.user.userId
-  const { business_name, business_type } = req.body
-  try {
-    const existing = await db('merchant_profiles').where({ user_id: userId }).first()
-    if (existing) return res.status(409).json({ error: 'Merchant profile already exists' })
+// ── GET /api/merchants (public listing) ─────────────────────────
+router.get('/', async (req, res) => {
+  const merchants = await db('merchants as m')
+    .join('users as u', 'm.user_id', 'u.id')
+    .where('m.status', 'approved')
+    .select('m.id', 'm.business_name', 'm.location', 'm.logo_url', 'm.rating', 'm.rating_count', 'm.description')
+    .orderBy('m.rating', 'desc')
 
-    const slug    = business_name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') + '-' + uuidv4().slice(0, 4)
-    const api_key = 'np_live_' + uuidv4().replace(/-/g, '')
-
-    const [merchant] = await db('merchant_profiles').insert({
-      user_id: userId, business_name: business_name.trim(),
-      business_type: business_type.trim(), slug, api_key,
-      fee_rate: parseFloat(process.env.MERCHANT_FEE_RATE || '0.008'),
-      created_at: new Date(),
-    }).returning('*')
-
-    await db('users').where({ id: userId }).update({ role: 'merchant' })
-
-    res.status(201).json({
-      message: 'Merchant account created',
-      merchant,
-      payment_link: `https://nanepay.com/pay/${slug}`,
-    })
-  } catch (err) {
-    logger.error('Merchant register failed', { err: err.message })
-    res.status(500).json({ error: 'Registration failed.' })
-  }
+  return res.json({ merchants })
 })
 
-router.get('/profile', async (req, res) => {
-  try {
-    const merchant = await db('merchant_profiles').where({ user_id: req.user.userId }).first()
-    if (!merchant) return res.status(404).json({ error: 'No merchant profile found' })
-    res.json({ ...merchant, payment_link: `https://nanepay.com/pay/${merchant.slug}` })
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch merchant profile' })
-  }
+// ── GET /api/merchants/dashboard ────────────────────────────────
+router.get('/dashboard', authenticate, requireRole('merchant', 'admin'), async (req, res) => {
+  const merchant = await db('merchants').where({ user_id: req.user.id }).first()
+  if (!merchant) return res.status(404).json({ message: 'Merchant profile not found' })
+
+  const wallet     = await db('merchant_wallets').where({ merchant_id: merchant.id }).first()
+  const offersCount = await db('wifi_offers').where({ merchant_id: merchant.id, active: true }).count('id as count').first()
+  const salesCount  = await db('wifi_purchases').where({ merchant_id: merchant.id, status: 'active' }).count('id as count').first()
+
+  // Revenue last 7 days
+  const recentRevenue = await db('wifi_purchases')
+    .where({ merchant_id: merchant.id })
+    .whereIn('status', ['active', 'expired'])
+    .where('created_at', '>=', new Date(Date.now() - 7 * 86400000))
+    .sum('merchant_credit as total')
+    .first()
+
+  return res.json({
+    merchant,
+    wallet: wallet || { balance: 0, total_earnings: 0, pending_withdrawal: 0 },
+    stats: {
+      activeOffers:   parseInt(offersCount?.count || 0),
+      totalSales:     parseInt(salesCount?.count || 0),
+      revenueThisWeek: parseFloat(recentRevenue?.total || 0),
+    },
+  })
 })
 
-router.post('/payment-links', async (req, res) => {
-  const { title, amount } = req.body
-  try {
-    const merchant = await db('merchant_profiles').where({ user_id: req.user.userId }).first()
-    if (!merchant) return res.status(403).json({ error: 'Merchant profile required' })
+// ── POST /api/merchants/offers ───────────────────────────────────
+router.post('/offers', authenticate, requireRole('merchant', 'admin'), async (req, res) => {
+  const merchant = await db('merchants').where({ user_id: req.user.id, status: 'approved' }).first()
+  if (!merchant) return res.status(403).json({ message: 'Merchant account not approved yet' })
 
-    const [link] = await db('payment_links').insert({
-      merchant_id: merchant.id, title: title?.trim() || 'Payment',
-      amount: amount ? parseFloat(amount) : null,
-      currency: 'KES', slug: uuidv4().slice(0, 8),
-      is_active: true, collected: 0, created_at: new Date(),
-    }).returning('*')
-
-    res.status(201).json({ ...link, url: `https://nanepay.com/pay/${link.slug}` })
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to create payment link' })
+  const { name, durationType, durationHours, price, speedProfile, maxDevices } = req.body
+  if (!name || !durationType || !durationHours || !price) {
+    return res.status(400).json({ message: 'name, durationType, durationHours, price are required' })
   }
+
+  const offerId = uuid()
+  await db('wifi_offers').insert({
+    id:             offerId,
+    merchant_id:    merchant.id,
+    name,
+    duration_type:  durationType,
+    duration_hours: durationHours,
+    price,
+    speed_profile:  speedProfile || '5Mbps',
+    max_devices:    maxDevices || 1,
+    active:         true,
+    created_at:     new Date(),
+    updated_at:     new Date(),
+  })
+
+  return res.status(201).json({ message: 'Offer created', offerId })
 })
 
-router.get('/payment-links', async (req, res) => {
-  try {
-    const merchant = await db('merchant_profiles').where({ user_id: req.user.userId }).first()
-    if (!merchant) return res.status(403).json({ error: 'Merchant profile required' })
-    const links = await db('payment_links').where({ merchant_id: merchant.id }).orderBy('created_at', 'desc')
-    res.json({ links: links.map(l => ({ ...l, url: `https://nanepay.com/pay/${l.slug}` })) })
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch payment links' })
-  }
+// ── PATCH /api/merchants/offers/:id ─────────────────────────────
+router.patch('/offers/:id', authenticate, requireRole('merchant', 'admin'), async (req, res) => {
+  const merchant = await db('merchants').where({ user_id: req.user.id }).first()
+  if (!merchant) return res.status(404).json({ message: 'Not found' })
+
+  const offer = await db('wifi_offers').where({ id: req.params.id, merchant_id: merchant.id }).first()
+  if (!offer) return res.status(404).json({ message: 'Offer not found' })
+
+  const allowed = ['name', 'price', 'speed_profile', 'max_devices', 'active']
+  const updates = {}
+  allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k] })
+  updates.updated_at = new Date()
+
+  await db('wifi_offers').where({ id: offer.id }).update(updates)
+  return res.json({ message: 'Offer updated' })
 })
 
-router.get('/analytics', async (req, res) => {
-  try {
-    const merchant = await db('merchant_profiles').where({ user_id: req.user.userId }).first()
-    if (!merchant) return res.status(403).json({ error: 'Merchant profile required' })
-    const [volume]    = await db('transactions').where({ receiver_id: req.user.userId, type: 'MERCHANT_PAYMENT', status: 'SUCCESSFUL' }).sum('amount as total').count('id as count')
-    const [fees_paid] = await db('transactions').where({ receiver_id: req.user.userId, type: 'MERCHANT_PAYMENT', status: 'SUCCESSFUL' }).sum('fee as total')
-    res.json({ total_volume: parseFloat(volume.total || 0), total_payments: parseInt(volume.count || 0), total_fees: parseFloat(fees_paid.total || 0), fee_rate: merchant.fee_rate })
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch analytics' })
-  }
+// ── GET /api/merchants/sales ─────────────────────────────────────
+router.get('/sales', authenticate, requireRole('merchant', 'admin'), async (req, res) => {
+  const merchant = await db('merchants').where({ user_id: req.user.id }).first()
+  if (!merchant) return res.status(404).json({ message: 'Not found' })
+
+  const sales = await db('wifi_purchases as p')
+    .join('wifi_offers as o', 'p.offer_id', 'o.id')
+    .join('users as u', 'p.customer_id', 'u.id')
+    .where('p.merchant_id', merchant.id)
+    .select('p.*', 'o.name as offer_name', 'u.name as customer_name', 'u.phone as customer_phone')
+    .orderBy('p.created_at', 'desc')
+    .limit(100)
+
+  return res.json({ sales })
 })
 
 module.exports = router
