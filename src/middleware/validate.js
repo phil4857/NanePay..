@@ -1,7 +1,6 @@
-// src/middleware/validate.js  ← NEW FILE
+// src/middleware/validate.js  ← REPLACEMENT
 const { validationResult, body } = require('express-validator')
 
-// Run validation and return errors if any
 const validate = (req, res, next) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
@@ -13,13 +12,34 @@ const validate = (req, res, next) => {
   next()
 }
 
-// Reusable validation rule sets
 const rules = {
   register: [
-    body('name').trim().notEmpty().withMessage('Name is required'),
-    body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
-    body('phone').matches(/^0[17]\d{8}$/).withMessage('Valid Kenyan phone required'),
-    body('password').isLength({ min: 8 }).withMessage('Password min 8 characters'),
+    body('name')
+      .trim()
+      .notEmpty()
+      .withMessage('Name is required'),
+    body('email')
+      .isEmail()
+      .normalizeEmail()
+      .withMessage('Valid email required'),
+    body('phone')
+      .trim()
+      .notEmpty()
+      .withMessage('Phone number is required')
+      .custom(val => {
+        const cleaned = String(val).replace(/\s+/g, '').replace(/^\+/, '')
+        // Accept 07XXXXXXXX, 01XXXXXXXX, 2547XXXXXXXX, 2541XXXXXXXX, +2547XXXXXXXX, +2541XXXXXXXX
+        const valid =
+          /^0[17]\d{8}$/.test(cleaned) ||
+          /^254[17]\d{8}$/.test(cleaned)
+        if (!valid) {
+          throw new Error('Enter a valid phone: 07XXXXXXXX, 01XXXXXXXX, or +254XXXXXXXXX')
+        }
+        return true
+      }),
+    body('password')
+      .isLength({ min: 8 })
+      .withMessage('Password min 8 characters'),
   ],
 
   login: [
