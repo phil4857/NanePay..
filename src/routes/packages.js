@@ -1,173 +1,152 @@
-const express = require('express')
-const db      = require('../config/database')
-const logger  = require('../config/logger')
-const { authenticate, requireActive } = require('../middleware/auth')
+// src/routes/packages.js  ← REPLACEMENT
+const express      = require('express')
+const { v4: uuid } = require('uuid')
+const db           = require('../db')
+const logger       = require('../config/logger')
+const { authenticate, requireRole } = require('../middleware')
 
 const router = express.Router()
 
 // ── GET /api/packages ─────────────────────────────────────────
+// Public — list all active packages
 router.get('/', async (req, res) => {
   try {
-    const { category, merchant_id } = req.query
+    const { merchantId, type } = req.query
 
-    let query = db('packages as p')
-      .join('merchant_profiles as m', 'p.merchant_id', 'm.id')
-      .where({ 'p.is_active': true })
+    let query = db('wifi_offers as o')
+      .join('merchants as m', 'o.merchant_id', 'm.id')
+      .where('o.active', true)
+      .where('m.status', 'approved')
       .select(
-        'p.*',
-        'm.business_name',
-        'm.business_logo',
-        'm.avg_rating',
-        'm.slug as merchant_slug'
+        'o.id', 'o.name', 'o.duration_type', 'o.duration_hours',
+        'o.price', 'o.speed_profile', 'o.max_devices', 'o.purchase_count',
+        'm.id as merchant_id', 'm.business_name', 'm.location',
+        'm.logo_url', 'm.rating',
       )
-      .orderBy('p.price', 'asc')
+      .orderBy('o.price', 'asc')
 
-    if (category)    query = query.where({ 'p.category': category.toUpperCase() })
-    if (merchant_id) query = query.where({ 'p.merchant_id': merchant_id })
+    if (merchantId) query = query.where('o.merchant_id', merchantId)
+    if (type)       query = query.where('o.duration_type', type)
 
     const packages = await query
-    res.json({ packages })
+    return res.json({ packages })
   } catch (err) {
     logger.error('Get packages failed', { err: err.message })
-    res.status(500).json({ error: 'Failed to fetch packages' })
+    return res.status(500).json({ error: 'Failed to fetch packages' })
   }
 })
 
 // ── GET /api/packages/:id ─────────────────────────────────────
 router.get('/:id', async (req, res) => {
   try {
-    const pkg = await db('packages as p')
-      .join('merchant_profiles as m', 'p.merchant_id', 'm.id')
-      .where({ 'p.id': req.params.id })
-      .select('p.*', 'm.business_name', 'm.slug as merchant_slug')
+    const pkg = await db('wifi_offers as o')
+      .join('merchants as m', 'o.merchant_id', 'm.id')
+      .where('o.id', req.params.id)
+      .select(
+        'o.*',
+        'm.business_name', 'm.location', 'm.logo_url',
+        'm.rating', 'm.rating_count', 'm.description as merchant_description',
+      )
       .first()
 
     if (!pkg) return res.status(404).json({ error: 'Package not found' })
-    res.json({ package: pkg })
+    return res.json({ package: pkg })
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch package' })
+    logger.error('Get package failed', { err: err.message })
+    return res.status(500).json({ error: 'Failed to fetch package' })
   }
 })
 
-// ── POST /api/packages ────────────────────────────────────────
-router.post('/', authenticate, requireActive, async (req, res) => {
-  const userId = req.user.userId
-  const {
-    name, description, category,
-    duration_type, duration_value,
-    price, speed_profile, device_limit,
-  } = req.body
-
-  if (!name || !duration_type || !duration_value || !price) {
-    return res.status(400).json({
-      error: 'name, duration_type, duration_value and price are required',
-    })
-  }
-
+// ── POST /api/packages  (merchant creates package) ────────────
+router.post('/', authenticate, requireRole('merchant', 'admin'), async (req, res) => {
   try {
-    const merchant = await db('merchant_profiles')
-      .where({ user_id: userId })
+    const merchant = await db('merchants')
+      .where({ user_id: req.user.id, status: 'approved' })
       .first()
 
     if (!merchant) {
-      return res.status(403).json({ error: 'Merchant profile required' })
+      return res.status(403).json({ error: 'Merchant account not approved yet' })
     }
 
-    const [pkg] = await db('packages').insert({
-      merchant_id:    merchant.id,
-      name:           name.trim(),
-      description:    description ? description.trim() : null,
-      category:       (category || 'WIFI').toUpperCase(),
-      duration_type:  duration_type.toUpperCase(),
-      duration_value: parseInt(duration_value),
-      price:          parseFloat(price),
-      speed_profile:  speed_profile ? speed_profile.trim() : null,
-      device_limit:   parseInt(device_limit || 1),
-      is_active:      true,
-      created_at:     new Date(),
-    }).returning('*')
+    const { name, durationType, durationHours, price, speedProfile, maxDevices } = req.body
 
-    res.status(201).json({ message: 'Package created', package: pkg })
+    if (!name || !durationType || !durationHours || !price) {
+      return res.status(400).json({ error: 'name, durationType, durationHours, price are required' })
+    }
+
+    const validTypes = ['hourly', 'midnight', 'daily', 'weekly', 'monthly']
+    if (!validTypes.includes(durationType)) {
+      return res.status(400).json({ error: `durationType must be one of: ${validTypes.join(', ')}` })
+    }
+
+    const id = uuid()
+    await db('wifi_offers').insert({
+      id,
+      merchant_id:    merchant.id,
+      name,
+      duration_type:  durationType,
+      duration_hours: parseInt(durationHours),
+      price:          parseFloat(price),
+      speed_profile:  speedProfile  || '5Mbps',
+      max_devices:    maxDevices    || 1,
+      active:         true,
+      purchase_count: 0,
+      created_at:     new Date(),
+      updated_at:     new Date(),
+    })
+
+    return res.status(201).json({ message: 'Package created successfully', packageId: id })
   } catch (err) {
     logger.error('Create package failed', { err: err.message })
-    res.status(500).json({ error: 'Failed to create package' })
+    return res.status(500).json({ error: 'Failed to create package' })
   }
 })
 
-// ── PATCH /api/packages/:id ───────────────────────────────────
-router.patch('/:id', authenticate, requireActive, async (req, res) => {
-  const userId = req.user.userId
-
+// ── PATCH /api/packages/:id  (merchant updates package) ───────
+router.patch('/:id', authenticate, requireRole('merchant', 'admin'), async (req, res) => {
   try {
-    const merchant = await db('merchant_profiles')
-      .where({ user_id: userId })
-      .first()
+    const merchant = await db('merchants').where({ user_id: req.user.id }).first()
+    if (!merchant) return res.status(404).json({ error: 'Merchant not found' })
 
-    if (!merchant) {
-      return res.status(403).json({ error: 'Merchant profile required' })
-    }
-
-    const pkg = await db('packages')
+    const pkg = await db('wifi_offers')
       .where({ id: req.params.id, merchant_id: merchant.id })
       .first()
+    if (!pkg) return res.status(404).json({ error: 'Package not found' })
 
-    if (!pkg) {
-      return res.status(404).json({ error: 'Package not found' })
-    }
-
-    const allowed = ['name', 'description', 'price', 'speed_profile', 'device_limit', 'is_active']
+    const allowed = ['name', 'price', 'speed_profile', 'max_devices', 'active']
     const updates = {}
+    allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k] })
+    updates.updated_at = new Date()
 
-    allowed.forEach(function(k) {
-      if (req.body[k] !== undefined) {
-        updates[k] = req.body[k]
-      }
-    })
-
-    if (Object.keys(updates).length === 0) {
-      return res.status(400).json({ error: 'No valid fields to update' })
-    }
-
-    const [updated] = await db('packages')
-      .where({ id: pkg.id })
-      .update(updates)
-      .returning('*')
-
-    res.json({ message: 'Package updated', package: updated })
+    await db('wifi_offers').where({ id: pkg.id }).update(updates)
+    return res.json({ message: 'Package updated successfully' })
   } catch (err) {
     logger.error('Update package failed', { err: err.message })
-    res.status(500).json({ error: 'Failed to update package' })
+    return res.status(500).json({ error: 'Failed to update package' })
   }
 })
 
-// ── DELETE /api/packages/:id ──────────────────────────────────
-router.delete('/:id', authenticate, requireActive, async (req, res) => {
-  const userId = req.user.userId
-
+// ── DELETE /api/packages/:id  (merchant deletes package) ──────
+router.delete('/:id', authenticate, requireRole('merchant', 'admin'), async (req, res) => {
   try {
-    const merchant = await db('merchant_profiles')
-      .where({ user_id: userId })
-      .first()
+    const merchant = await db('merchants').where({ user_id: req.user.id }).first()
+    if (!merchant) return res.status(404).json({ error: 'Merchant not found' })
 
-    if (!merchant) {
-      return res.status(403).json({ error: 'Merchant profile required' })
-    }
-
-    const pkg = await db('packages')
+    const pkg = await db('wifi_offers')
       .where({ id: req.params.id, merchant_id: merchant.id })
       .first()
+    if (!pkg) return res.status(404).json({ error: 'Package not found' })
 
-    if (!pkg) {
-      return res.status(404).json({ error: 'Package not found' })
-    }
+    // Soft delete — just deactivate
+    await db('wifi_offers').where({ id: pkg.id }).update({
+      active:     false,
+      updated_at: new Date(),
+    })
 
-    await db('packages')
-      .where({ id: pkg.id })
-      .update({ is_active: false })
-
-    res.json({ message: 'Package deactivated' })
+    return res.json({ message: 'Package deactivated successfully' })
   } catch (err) {
-    res.status(500).json({ error: 'Failed to deactivate package' })
+    logger.error('Delete package failed', { err: err.message })
+    return res.status(500).json({ error: 'Failed to delete package' })
   }
 })
 
