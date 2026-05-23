@@ -1,52 +1,66 @@
-const express = require('express')
-const db      = require('../config/database')
-const logger  = require('../config/logger')
-const { authenticate } = require('../middleware/auth')
+const router = require('express').Router();
+const auth = require('../middleware/auth');
+const mongoose = require('mongoose');
 
-const router = express.Router()
-router.use(authenticate)
+const notifSchema = new mongoose.Schema({
+  user:    { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  type:    { type: String }, // promo, investment, wifi, birthday, referral, system
+  title:   { type: String, required: true },
+  body:    { type: String, required: true },
+  read:    { type: Boolean, default: false },
+  readAt:  { type: Date },
+}, { timestamps: true });
 
-// ── GET /api/notifications ────────────────────────────────────
-router.get('/', async (req, res) => {
+const Notification = mongoose.models.Notification || mongoose.model('Notification', notifSchema);
+
+// Get all notifications for user
+router.get('/', auth, async (req, res) => {
   try {
-    const notifications = await db('notifications')
-      .where({ user_id: req.user.userId })
-      .orderBy('created_at', 'desc')
-      .limit(50)
-
-    const unread = await db('notifications')
-      .where({ user_id: req.user.userId, is_read: false })
-      .count('id as count')
-      .first()
-
-    res.json({ notifications, unread_count: parseInt(unread.count) })
+    const notifs = await Notification.find({ user: req.user.id })
+      .sort({ createdAt: -1 }).limit(50);
+    const unreadCount = await Notification.countDocuments({ user: req.user.id, read: false });
+    res.json({ notifications: notifs, unreadCount });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch notifications' })
+    res.status(500).json({ message: err.message });
   }
-})
+});
 
-// ── PATCH /api/notifications/read-all ─────────────────────────
-router.patch('/read-all', async (req, res) => {
+// Mark single notification as read
+router.patch('/:id/read', auth, async (req, res) => {
   try {
-    await db('notifications')
-      .where({ user_id: req.user.userId, is_read: false })
-      .update({ is_read: true })
-    res.json({ message: 'All notifications marked as read' })
+    const notif = await Notification.findOneAndUpdate(
+      { _id: req.params.id, user: req.user.id },
+      { read: true, readAt: new Date() },
+      { new: true }
+    );
+    if (!notif) return res.status(404).json({ message: 'Notification not found' });
+    res.json(notif);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to update notifications' })
+    res.status(500).json({ message: err.message });
   }
-})
+});
 
-// ── PATCH /api/notifications/:id/read ─────────────────────────
-router.patch('/:id/read', async (req, res) => {
+// Mark all as read
+router.patch('/read-all', auth, async (req, res) => {
   try {
-    await db('notifications')
-      .where({ id: req.params.id, user_id: req.user.userId })
-      .update({ is_read: true })
-    res.json({ message: 'Notification marked as read' })
+    await Notification.updateMany(
+      { user: req.user.id, read: false },
+      { read: true, readAt: new Date() }
+    );
+    res.json({ message: 'All notifications marked as read' });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to update notification' })
+    res.status(500).json({ message: err.message });
   }
-})
+});
 
-module.exports = router
+// Internal helper to create a notification (used by other services)
+const createNotification = async (userId, type, title, body) => {
+  try {
+    return await Notification.create({ user: userId, type, title, body });
+  } catch (err) {
+    console.error('[Notification Error]', err.message);
+  }
+};
+
+module.exports = router;
+module.exports.createNotification = createNotification;
