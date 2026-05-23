@@ -1,109 +1,114 @@
-// src/routes/merchants.js  ← NEW FILE
-const express = require('express')
-const { v4: uuid } = require('uuid')
-const db      = require('../db')
-const { authenticate, requireRole } = require('../middleware/auth')
+const router = require('express').Router();
+const auth = require('../middleware/auth');
+const mongoose = require('mongoose');
+const User = require('../models/User');
+const Transaction = require('../models/Transaction');
+const { sendSMS } = require('../services/sms');
+const { sendReceiptEmail } = require('../services/email');
+const crypto = require('crypto');
 
-const router = express.Router()
+const FEE_RATE = parseFloat(process.env.PLATFORM_FEE_RATE || '0.01');
+const calcFee = (a) => Math.ceil(Number(a) * FEE_RATE * 100) / 100;
 
-// ── GET /api/merchants (public listing) ─────────────────────────
-router.get('/', async (req, res) => {
-  const merchants = await db('merchants as m')
-    .join('users as u', 'm.user_id', 'u.id')
-    .where('m.status', 'approved')
-    .select('m.id', 'm.business_name', 'm.location', 'm.logo_url', 'm.rating', 'm.rating_count', 'm.description')
-    .orderBy('m.rating', 'desc')
+// Merchant profile schema
+const merchantSchema = new mongoose.Schema({
+  owner:       { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, unique: true },
+  businessName:{ type: String, required: true },
+  paymentSlug: { type: String, unique: true },
+  totalSales:  { type: Number, default: 0 },
+  txnCount:    { type: Number, default: 0 },
+  platformCut: { type: Number, default: 0 },
+  status:      { type: String, enum: ['active','suspended'], default: 'active' },
+}, { timestamps: true });
 
-  return res.json({ merchants })
-})
+const Merchant = mongoose.models.Merchant || mongoose.model('Merchant', merchantSchema);
 
-// ── GET /api/merchants/dashboard ────────────────────────────────
-router.get('/dashboard', authenticate, requireRole('merchant', 'admin'), async (req, res) => {
-  const merchant = await db('merchants').where({ user_id: req.user.id }).first()
-  if (!merchant) return res.status(404).json({ message: 'Merchant profile not found' })
-
-  const wallet     = await db('merchant_wallets').where({ merchant_id: merchant.id }).first()
-  const offersCount = await db('wifi_offers').where({ merchant_id: merchant.id, active: true }).count('id as count').first()
-  const salesCount  = await db('wifi_purchases').where({ merchant_id: merchant.id, status: 'active' }).count('id as count').first()
-
-  // Revenue last 7 days
-  const recentRevenue = await db('wifi_purchases')
-    .where({ merchant_id: merchant.id })
-    .whereIn('status', ['active', 'expired'])
-    .where('created_at', '>=', new Date(Date.now() - 7 * 86400000))
-    .sum('merchant_credit as total')
-    .first()
-
-  return res.json({
-    merchant,
-    wallet: wallet || { balance: 0, total_earnings: 0, pending_withdrawal: 0 },
-    stats: {
-      activeOffers:   parseInt(offersCount?.count || 0),
-      totalSales:     parseInt(salesCount?.count || 0),
-      revenueThisWeek: parseFloat(recentRevenue?.total || 0),
-    },
-  })
-})
-
-// ── POST /api/merchants/offers ───────────────────────────────────
-router.post('/offers', authenticate, requireRole('merchant', 'admin'), async (req, res) => {
-  const merchant = await db('merchants').where({ user_id: req.user.id, status: 'approved' }).first()
-  if (!merchant) return res.status(403).json({ message: 'Merchant account not approved yet' })
-
-  const { name, durationType, durationHours, price, speedProfile, maxDevices } = req.body
-  if (!name || !durationType || !durationHours || !price) {
-    return res.status(400).json({ message: 'name, durationType, durationHours, price are required' })
+// Register as merchant
+router.post('/register', auth, async (req, res) => {
+  try {
+    const { businessName } = req.body;
+    if (!businessName) return res.status(400).json({ message: 'Business name required' });
+    const existing = await Merchant.findOne({ owner: req.user.id });
+    if (existing) return res.status(409).json({ message: 'Merchant account already exists', merchant: existing });
+    const slug = businessName.toLowerCase().replace(/\s+/g, '-') + '-' + crypto.randomBytes(3).toString('hex');
+    const merchant = await Merchant.create({ owner: req.user.id, businessName, paymentSlug: slug });
+    res.status(201).json(merchant);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
   }
+});
 
-  const offerId = uuid()
-  await db('wifi_offers').insert({
-    id:             offerId,
-    merchant_id:    merchant.id,
-    name,
-    duration_type:  durationType,
-    duration_hours: durationHours,
-    price,
-    speed_profile:  speedProfile || '5Mbps',
-    max_devices:    maxDevices || 1,
-    active:         true,
-    created_at:     new Date(),
-    updated_at:     new Date(),
-  })
+// Get merchant dashboard
+router.get('/dashboard', auth, async (req, res) => {
+  try {
+    const merchant = await Merchant.findOne({ owner: req.user.id });
+    if (!merchant) return res.status(404).json({ message: 'No merchant account. Register first.' });
 
-  return res.status(201).json({ message: 'Offer created', offerId })
-})
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const todayTxs = await Transaction.find({
+      user: req.user.id, type: { $in: ['transfer', 'deposit'] },
+      createdAt: { $gte: today }, status: 'success',
+    });
 
-// ── PATCH /api/merchants/offers/:id ─────────────────────────────
-router.patch('/offers/:id', authenticate, requireRole('merchant', 'admin'), async (req, res) => {
-  const merchant = await db('merchants').where({ user_id: req.user.id }).first()
-  if (!merchant) return res.status(404).json({ message: 'Not found' })
+    const todaySales  = todayTxs.reduce((s, t) => s + Math.abs(t.amount), 0);
+    const todayFees   = todayTxs.reduce((s, t) => s + (t.fee || 0), 0);
 
-  const offer = await db('wifi_offers').where({ id: req.params.id, merchant_id: merchant.id }).first()
-  if (!offer) return res.status(404).json({ message: 'Offer not found' })
+    res.json({
+      merchant,
+      paymentLink: `${process.env.FRONTEND_URL}/pay/${merchant.paymentSlug}`,
+      todaySales,
+      todayFees,
+      todayNet:   todaySales - todayFees,
+      todayTxns:  todayTxs.length,
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
 
-  const allowed = ['name', 'price', 'speed_profile', 'max_devices', 'active']
-  const updates = {}
-  allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k] })
-  updates.updated_at = new Date()
+// Public payment endpoint — customer pays merchant via link
+router.post('/pay/:slug', auth, async (req, res) => {
+  try {
+    const { amount, pin } = req.body;
+    if (!amount || amount < 1) return res.status(400).json({ message: 'Invalid amount' });
 
-  await db('wifi_offers').where({ id: offer.id }).update(updates)
-  return res.json({ message: 'Offer updated' })
-})
+    const merchant = await Merchant.findOne({ paymentSlug: req.params.slug, status: 'active' });
+    if (!merchant) return res.status(404).json({ message: 'Merchant not found' });
 
-// ── GET /api/merchants/sales ─────────────────────────────────────
-router.get('/sales', authenticate, requireRole('merchant', 'admin'), async (req, res) => {
-  const merchant = await db('merchants').where({ user_id: req.user.id }).first()
-  if (!merchant) return res.status(404).json({ message: 'Not found' })
+    const payer = await User.findById(req.user.id);
+    const pinOk = await payer.comparePIN(pin);
+    if (!pinOk) return res.status(401).json({ message: 'Incorrect PIN' });
 
-  const sales = await db('wifi_purchases as p')
-    .join('wifi_offers as o', 'p.offer_id', 'o.id')
-    .join('users as u', 'p.customer_id', 'u.id')
-    .where('p.merchant_id', merchant.id)
-    .select('p.*', 'o.name as offer_name', 'u.name as customer_name', 'u.phone as customer_phone')
-    .orderBy('p.created_at', 'desc')
-    .limit(100)
+    const f = calcFee(amount);
+    const totalDeduct = amount + f;
+    if (payer.balance < totalDeduct) return res.status(400).json({ message: 'Insufficient balance' });
 
-  return res.json({ sales })
-})
+    await User.findByIdAndUpdate(payer._id, { $inc: { balance: -totalDeduct } });
 
-module.exports = router
+    const merchantOwner = await User.findById(merchant.owner);
+    const merchantEarns = amount - f;
+    await User.findByIdAndUpdate(merchant.owner, { $inc: { balance: merchantEarns } });
+
+    await Merchant.findByIdAndUpdate(merchant._id, {
+      $inc: { totalSales: amount, txnCount: 1, platformCut: f },
+    });
+
+    const tx = await Transaction.create({
+      user: payer._id, type: 'transfer',
+      label: `Payment to ${merchant.businessName}`,
+      amount: -amount, fee: f, status: 'success',
+      recipient: merchant.owner,
+      metadata: { merchantSlug: req.params.slug, merchantName: merchant.businessName },
+    });
+
+    await sendSMS(payer.phone, `NanePay: KES ${amount} paid to ${merchant.businessName}. Fee: KES ${f.toFixed(2)}. Ref: ${tx.ref}`);
+    await sendSMS(merchantOwner.phone, `NanePay: KES ${merchantEarns.toFixed(2)} received from ${payer.name}. Ref: ${tx.ref}`);
+    await sendReceiptEmail(payer, tx);
+
+    res.json({ transaction: tx, fee: f });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+module.exports = router;
