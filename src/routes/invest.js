@@ -1,253 +1,120 @@
-// src/routes/invest.js  ← REPLACEMENT
-const express = require('express')
-const { v4: uuid } = require('uuid')
-const db      = require('../db')
-const logger  = require('../config/logger')
-const { authenticate } = require('../middleware/auth')
+const router = require('express').Router();
+const auth = require('../middleware/auth');
+const mongoose = require('mongoose');
+const User = require('../models/User');
+const Transaction = require('../models/Transaction');
+const { sendSMS } = require('../services/sms');
+const { sendReceiptEmail } = require('../services/email');
 
-const router = express.Router()
+const FEE_RATE = parseFloat(process.env.PLATFORM_FEE_RATE || '0.01');
+const calcFee = (a) => Math.ceil(Number(a) * FEE_RATE * 100) / 100;
 
-// ── INVESTMENT PLANS ──────────────────────────────────────────
-const INVESTMENT_PLANS = [
-  {
-    id:         'starter',
-    name:       'Starter',
-    apy:        0.08,         // 8% APY
-    min_amount: 500,
-    lock_days:  30,
-    description: 'Low risk, 8% annual return. Locked for 30 days.',
-  },
-  {
-    id:         'growth',
-    name:       'Growth',
-    apy:        0.15,         // 15% APY
-    min_amount: 2000,
-    lock_days:  90,
-    description: 'Medium risk, 15% annual return. Locked for 90 days.',
-  },
-  {
-    id:         'premium',
-    name:       'Premium',
-    apy:        0.25,         // 25% APY
-    min_amount: 10000,
-    lock_days:  180,
-    description: 'Higher return, 25% annual return. Locked for 180 days.',
-  },
-  {
-    id:         'flexible',
-    name:       'Flexible',
-    apy:        0.05,         // 5% APY
-    min_amount: 100,
-    lock_days:  0,            // no lock
-    description: 'No lock-in, withdraw anytime. 5% annual return.',
-  },
-]
+// Investment schema inline (or move to models/Investment.js)
+const investmentSchema = new mongoose.Schema({
+  user:       { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  planName:   { type: String, required: true },
+  amount:     { type: Number, required: true },
+  fee:        { type: Number, default: 0 },
+  roi:        { type: Number, required: true },   // percentage e.g. 18
+  durationDays: { type: Number, required: true },
+  expectedReturn: { type: Number },
+  status:     { type: String, enum: ['active','matured','withdrawn'], default: 'active' },
+  startedAt:  { type: Date, default: Date.now },
+  maturesAt:  { type: Date },
+}, { timestamps: true });
 
-function calcInvestmentReturn(principal, apy, days) {
-  const earnings = parseFloat((principal * apy * (days / 365)).toFixed(2))
-  const total    = parseFloat((principal + earnings).toFixed(2))
-  return { earnings, total }
-}
+investmentSchema.pre('save', function (next) {
+  if (!this.maturesAt) {
+    const d = new Date(this.startedAt);
+    d.setDate(d.getDate() + this.durationDays);
+    this.maturesAt = d;
+  }
+  if (!this.expectedReturn) {
+    this.expectedReturn = this.amount * (1 + this.roi / 100);
+  }
+  next();
+});
 
-// ── GET /api/invest/plans ─────────────────────────────────────
-router.get('/plans', authenticate, (req, res) => {
-  res.json({ plans: INVESTMENT_PLANS })
-})
+const Investment = mongoose.models.Investment || mongoose.model('Investment', investmentSchema);
 
-// ── GET /api/invest/mine ──────────────────────────────────────
-router.get('/mine', authenticate, async (req, res) => {
+const PLANS = [
+  { name: 'Starter',  min: 500,    max: 4999,   roi: 8,  days: 30  },
+  { name: 'Silver',   min: 5000,   max: 19999,  roi: 12, days: 60  },
+  { name: 'Gold',     min: 20000,  max: 99999,  roi: 18, days: 90  },
+  { name: 'Platinum', min: 100000, max: 999999, roi: 24, days: 180 },
+];
+
+// Get all plans
+router.get('/plans', (req, res) => res.json(PLANS));
+
+// Get user's investments
+router.get('/', auth, async (req, res) => {
   try {
-    const investments = await db('investments')
-      .where({ user_id: req.user.id })
-      .orderBy('created_at', 'desc')
-
-    const enriched = investments.map(inv => {
-      const plan = INVESTMENT_PLANS.find(p => p.id === inv.plan_id)
-      if (!plan) return inv
-      const days = Math.floor((Date.now() - new Date(inv.started_at).getTime()) / 86400000)
-      const { earnings, total } = calcInvestmentReturn(parseFloat(inv.amount), plan.apy, days)
-      return {
-        ...inv,
-        plan,
-        amount:        parseFloat(inv.amount),
-        current_value: total,
-        earnings,
-        days_active:   days,
-      }
-    })
-
-    return res.json({ investments: enriched })
+    const investments = await Investment.find({ user: req.user.id }).sort({ createdAt: -1 });
+    res.json(investments);
   } catch (err) {
-    logger.error('Failed to fetch investments', { err: err.message })
-    return res.status(500).json({ error: 'Failed to fetch investments' })
+    res.status(500).json({ message: err.message });
   }
-})
+});
 
-// ── POST /api/invest ──────────────────────────────────────────
-router.post('/', authenticate, async (req, res) => {
-  const { plan_id } = req.body
-  const amount      = parseFloat(req.body.amount)
-
-  if (!plan_id || !amount || amount <= 0) {
-    return res.status(400).json({ error: 'plan_id and amount are required' })
-  }
-
-  const plan = INVESTMENT_PLANS.find(p => p.id === plan_id)
-  if (!plan) return res.status(400).json({ error: 'Invalid plan' })
-  if (amount < plan.min_amount) {
-    return res.status(400).json({ error: `Minimum investment is KES ${plan.min_amount}` })
-  }
-
+// Create investment
+router.post('/', auth, async (req, res) => {
   try {
-    const matures_at = plan.lock_days > 0
-      ? new Date(Date.now() + plan.lock_days * 86400000)
-      : null
+    const { planName, amount, pin } = req.body;
+    const plan = PLANS.find(p => p.name === planName);
+    if (!plan) return res.status(400).json({ message: 'Invalid plan' });
+    if (amount < plan.min || amount > plan.max)
+      return res.status(400).json({ message: `Amount must be KES ${plan.min} – ${plan.max}` });
 
-    const investmentId = uuid()
+    const user = await User.findById(req.user.id);
+    const pinOk = await user.comparePIN(pin);
+    if (!pinOk) return res.status(401).json({ message: 'Incorrect PIN' });
 
-    await db.transaction(async trx => {
-      // Lock and check wallet
-      const wallet = await trx('wallets')
-        .where({ user_id: req.user.id })
-        .forUpdate()
-        .first()
+    const f = calcFee(amount);
+    const totalDeduct = amount + f;
+    if (user.balance < totalDeduct) return res.status(400).json({ message: 'Insufficient balance' });
 
-      if (!wallet) throw new Error('WALLET_NOT_FOUND')
-      if (parseFloat(wallet.available_balance) < amount) throw new Error('INSUFFICIENT_BALANCE')
+    await User.findByIdAndUpdate(user._id, { $inc: { balance: -totalDeduct } });
 
-      // Deduct from available balance
-      await trx('wallets').where({ user_id: req.user.id }).update({
-        available_balance: db.raw('available_balance - ?', [amount]),
-        total_balance:     db.raw('total_balance - ?', [amount]),
-        updated_at:        new Date(),
-      })
+    const inv = await Investment.create({
+      user: user._id, planName, amount, fee: f, roi: plan.roi, durationDays: plan.days,
+    });
 
-      // Create investment record
-      await trx('investments').insert({
-        id:         investmentId,
-        user_id:    req.user.id,
-        plan_id,
-        amount,
-        status:     'active',
-        started_at: new Date(),
-        matures_at,
-        created_at: new Date(),
-        updated_at: new Date(),
-      })
+    const tx = await Transaction.create({
+      user: user._id, type: 'investment', label: `Invest — ${planName} Plan`,
+      amount: -amount, fee: f, status: 'success',
+      metadata: { planName, roi: plan.roi, days: plan.days, investmentId: inv._id },
+    });
 
-      // Record transaction
-      const ref = `INV-${uuid().split('-')[0].toUpperCase()}`
-      await trx('transactions').insert({
-        id:          uuid(),
-        user_id:     req.user.id,
-        type:        'investment_in',
-        amount,
-        fee:         0,
-        net_amount:  amount,
-        status:      'completed',
-        reference:   ref,
-        description: `Invested in ${plan.name} plan`,
-        metadata:    JSON.stringify({ plan_id, investment_id: investmentId }),
-        created_at:  new Date(),
-        updated_at:  new Date(),
-      })
-    })
+    await sendSMS(user.phone, `NanePay: KES ${amount} invested in ${planName} plan (${plan.roi}% ROI). Matures in ${plan.days} days. Fee: KES ${f.toFixed(2)}. Ref: ${tx.ref}`);
+    await sendReceiptEmail(user, tx);
 
-    const expectedReturn = calcInvestmentReturn(amount, plan.apy, plan.lock_days || 365)
-
-    return res.status(201).json({
-      message:         'Investment started successfully',
-      investmentId,
-      plan,
-      amount,
-      matures_at,
-      expected_return: expectedReturn,
-    })
-
+    res.status(201).json({ investment: inv, transaction: tx });
   } catch (err) {
-    if (err.message === 'INSUFFICIENT_BALANCE') {
-      return res.status(400).json({ error: 'Insufficient balance' })
-    }
-    if (err.message === 'WALLET_NOT_FOUND') {
-      return res.status(404).json({ error: 'Wallet not found' })
-    }
-    logger.error('Investment failed', { err: err.message })
-    return res.status(500).json({ error: 'Investment failed. Please try again.' })
+    res.status(500).json({ message: err.message });
   }
-})
+});
 
-// ── POST /api/invest/:id/withdraw ─────────────────────────────
-router.post('/:id/withdraw', authenticate, async (req, res) => {
+// Withdraw matured investment
+router.post('/:id/withdraw', auth, async (req, res) => {
   try {
-    const investment = await db('investments')
-      .where({ id: req.params.id, user_id: req.user.id })
-      .first()
+    const inv = await Investment.findOne({ _id: req.params.id, user: req.user.id });
+    if (!inv) return res.status(404).json({ message: 'Investment not found' });
+    if (inv.status !== 'active') return res.status(400).json({ message: 'Investment already withdrawn' });
+    if (new Date() < inv.maturesAt) return res.status(400).json({ message: 'Investment has not matured yet' });
 
-    if (!investment) {
-      return res.status(404).json({ error: 'Investment not found' })
-    }
-    if (investment.status !== 'active') {
-      return res.status(400).json({ error: 'Investment already withdrawn' })
-    }
+    const payout = inv.expectedReturn;
+    await User.findByIdAndUpdate(req.user.id, { $inc: { balance: payout } });
+    inv.status = 'withdrawn';
+    await inv.save();
 
-    const plan = INVESTMENT_PLANS.find(p => p.id === investment.plan_id)
-    if (!plan) return res.status(400).json({ error: 'Plan not found' })
+    const user = await User.findById(req.user.id);
+    await sendSMS(user.phone, `NanePay: Your ${inv.planName} investment matured! KES ${payout.toFixed(2)} credited to your wallet.`);
 
-    // Check lock period
-    if (plan.lock_days > 0 && investment.matures_at && new Date() < new Date(investment.matures_at)) {
-      return res.status(400).json({
-        error: `Investment is locked until ${new Date(investment.matures_at).toLocaleDateString('en-KE')}`,
-      })
-    }
-
-    const days             = Math.floor((Date.now() - new Date(investment.started_at).getTime()) / 86400000)
-    const principal        = parseFloat(investment.amount)
-    const { earnings, total } = calcInvestmentReturn(principal, plan.apy, days)
-
-    await db.transaction(async trx => {
-      // Mark investment withdrawn
-      await trx('investments').where({ id: investment.id }).update({
-        status:     'withdrawn',
-        updated_at: new Date(),
-      })
-
-      // Credit wallet
-      await trx('wallets').where({ user_id: req.user.id }).update({
-        available_balance: db.raw('available_balance + ?', [total]),
-        total_balance:     db.raw('total_balance + ?', [total]),
-        updated_at:        new Date(),
-      })
-
-      // Record transaction
-      const ref = `INV-OUT-${uuid().split('-')[0].toUpperCase()}`
-      await trx('transactions').insert({
-        id:          uuid(),
-        user_id:     req.user.id,
-        type:        'investment_out',
-        amount:      total,
-        fee:         0,
-        net_amount:  total,
-        status:      'completed',
-        reference:   ref,
-        description: `Withdrew from ${plan.name} — KES ${earnings} earned`,
-        metadata:    JSON.stringify({ plan_id: plan.id, investment_id: investment.id, principal, earnings, days }),
-        created_at:  new Date(),
-        updated_at:  new Date(),
-      })
-    })
-
-    return res.json({
-      message:   'Investment withdrawn successfully',
-      principal,
-      earnings,
-      total,
-      days_active: days,
-    })
-
+    res.json({ payout, investment: inv });
   } catch (err) {
-    logger.error('Investment withdrawal failed', { err: err.message })
-    return res.status(500).json({ error: 'Withdrawal failed. Please try again.' })
+    res.status(500).json({ message: err.message });
   }
-})
+});
 
-module.exports = router
+module.exports = router;
