@@ -1,184 +1,117 @@
-// src/routes/wifi.js  ← NEW FILE
-const express = require('express')
-const { v4: uuid } = require('uuid')
-const db      = require('../db')
-const ledger  = require('../services/ledger')
-const mpesa   = require('../services/mpesa')
-const { authenticate, requireRole } = require('../middleware/auth')
+const router = require('express').Router();
+const auth = require('../middleware/auth');
+const mongoose = require('mongoose');
+const User = require('../models/User');
+const Transaction = require('../models/Transaction');
+const HotspotVendor = require('../models/HotspotVendor');
+const { sendSMS } = require('../services/sms');
+const { sendReceiptEmail } = require('../services/email');
+const crypto = require('crypto');
 
-const router  = express.Router()
-const FEE_RATE = parseFloat(process.env.WIFI_FEE_RATE || '0.01')
+const FEE_RATE = parseFloat(process.env.PLATFORM_FEE_RATE || '0.01');
+const calcFee = (a) => Math.ceil(Number(a) * FEE_RATE * 100) / 100;
 
-// ── GET /api/wifi/offers ─────────────────────────────────────────
-// Public — list all active offers (with merchant info)
-router.get('/offers', async (req, res) => {
-  const { merchantId } = req.query
+// WiFi session schema
+const sessionSchema = new mongoose.Schema({
+  user:        { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  vendor:      { type: mongoose.Schema.Types.ObjectId, ref: 'HotspotVendor', required: true },
+  packageName: { type: String },
+  price:       { type: Number },
+  voucher:     { type: String, unique: true },
+  status:      { type: String, enum: ['active','expired'], default: 'active' },
+  expiresAt:   { type: Date },
+}, { timestamps: true });
 
-  let query = db('wifi_offers as o')
-    .join('merchants as m', 'o.merchant_id', 'm.id')
-    .join('users as u', 'm.user_id', 'u.id')
-    .where('o.active', true)
-    .where('m.status', 'approved')
-    .select(
-      'o.*',
-      'm.business_name', 'm.location', 'm.logo_url', 'm.rating',
-    )
-    .orderBy('o.price', 'asc')
+const WifiSession = mongoose.models.WifiSession || mongoose.model('WifiSession', sessionSchema);
 
-  if (merchantId) query = query.where('o.merchant_id', merchantId)
-
-  const offers = await query
-  return res.json({ offers })
-})
-
-// ── POST /api/wifi/purchase ──────────────────────────────────────
-// User purchases a WiFi offer — STK push flow
-router.post('/purchase', authenticate, async (req, res) => {
-  const { offerId } = req.body
-
-  const offer = await db('wifi_offers as o')
-    .join('merchants as m', 'o.merchant_id', 'm.id')
-    .where('o.id', offerId)
-    .where('o.active', true)
-    .where('m.status', 'approved')
-    .select('o.*', 'm.business_name')
-    .first()
-
-  if (!offer) return res.status(404).json({ message: 'Offer not available' })
-
-  const fee   = parseFloat((offer.price * FEE_RATE).toFixed(2))
-  const total = parseFloat((offer.price + fee).toFixed(2))
-  const ref   = `WIFI-${uuid().split('-')[0].toUpperCase()}`
-
+// Get all active vendors
+router.get('/vendors', async (req, res) => {
   try {
-    const stkData = await mpesa.stkPush({
-      phone:  req.user.phone,
-      amount: total,
-      ref,
-      desc:   `${offer.business_name} WiFi`,
-    })
+    const vendors = await HotspotVendor.find({ status: 'active' }).select('-__v');
+    res.json(vendors);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
 
-    if (stkData.ResponseCode !== '0') {
-      return res.status(400).json({ message: 'Payment initiation failed' })
+// Buy a WiFi package from a vendor
+router.post('/buy', auth, async (req, res) => {
+  try {
+    const { vendorId, packageId, pin } = req.body;
+
+    const user = await User.findById(req.user.id);
+    const pinOk = await user.comparePIN(pin);
+    if (!pinOk) return res.status(401).json({ message: 'Incorrect PIN' });
+
+    const vendor = await HotspotVendor.findById(vendorId);
+    if (!vendor || vendor.status !== 'active') return res.status(404).json({ message: 'Vendor not found or inactive' });
+
+    const pkg = vendor.packages.id(packageId);
+    if (!pkg) return res.status(404).json({ message: 'Package not found' });
+
+    const f = calcFee(pkg.price);
+    const totalDeduct = pkg.price + f;
+    if (user.balance < totalDeduct) return res.status(400).json({ message: 'Insufficient balance' });
+
+    // Deduct from user
+    await User.findByIdAndUpdate(user._id, { $inc: { balance: -totalDeduct } });
+
+    // Credit vendor (minus platform cut)
+    const vendorEarns = pkg.price - f;
+    await HotspotVendor.findByIdAndUpdate(vendor._id, {
+      $inc: { revenue: pkg.price, txnCount: 1, platformCut: f },
+    });
+
+    // Generate voucher code
+    const voucher = 'NW-' + crypto.randomBytes(4).toString('hex').toUpperCase();
+
+    // Parse duration into expiry
+    const expiresAt = new Date();
+    if (pkg.duration?.toLowerCase().includes('hour')) {
+      const hrs = parseInt(pkg.duration) || 1;
+      expiresAt.setHours(expiresAt.getHours() + hrs);
+    } else if (pkg.duration?.toLowerCase().includes('day')) {
+      const days = parseInt(pkg.duration) || 1;
+      expiresAt.setDate(expiresAt.getDate() + days);
+    } else if (pkg.duration?.toLowerCase().includes('week')) {
+      expiresAt.setDate(expiresAt.getDate() + 7);
+    } else if (pkg.duration?.toLowerCase().includes('month')) {
+      expiresAt.setDate(expiresAt.getDate() + 30);
+    } else {
+      expiresAt.setHours(expiresAt.getHours() + 1);
     }
 
-    // Create pending purchase
-    const purchaseId = uuid()
-    await db.transaction(async trx => {
-      await trx('transactions').insert({
-        id:                  uuid(),
-        user_id:             req.user.id,
-        type:                'wifi_purchase',
-        amount:              total,
-        fee,
-        net_amount:          offer.price,
-        status:              'pending',
-        reference:           ref,
-        checkout_request_id: stkData.CheckoutRequestID,
-        description:         `WiFi: ${offer.name} — ${offer.business_name}`,
-        metadata:            JSON.stringify({ offerId, merchantId: offer.merchant_id }),
-        created_at:          new Date(),
-        updated_at:          new Date(),
-      })
+    const session = await WifiSession.create({
+      user: user._id, vendor: vendor._id,
+      packageName: pkg.name, price: pkg.price, voucher, expiresAt,
+    });
 
-      await trx('wifi_purchases').insert({
-        id:                  purchaseId,
-        customer_id:         req.user.id,
-        merchant_id:         offer.merchant_id,
-        offer_id:            offerId,
-        amount:              total,
-        fee,
-        merchant_credit:     offer.price,
-        status:              'pending',
-        checkout_request_id: stkData.CheckoutRequestID,
-        created_at:          new Date(),
-        updated_at:          new Date(),
-      })
-    })
+    const tx = await Transaction.create({
+      user: user._id, type: 'wifi',
+      label: `${vendor.name} — ${pkg.name}`,
+      amount: -pkg.price, fee: f, status: 'success',
+      metadata: { vendorId, packageId, voucher, expiresAt },
+    });
 
-    return res.json({
-      message:           'Enter your M-Pesa PIN to activate WiFi.',
-      checkoutRequestId: stkData.CheckoutRequestID,
-      purchaseId,
-      offer: { name: offer.name, price: offer.price, duration: offer.duration_type },
-      fee,
-      total,
-    })
+    await sendSMS(user.phone, `NanePay WiFi: ${vendor.name} ${pkg.name} activated! Voucher: ${voucher}. Valid until ${expiresAt.toLocaleString('en-KE')}. Fee: KES ${f.toFixed(2)}. Ref: ${tx.ref}`);
+    await sendReceiptEmail(user, tx);
+
+    res.status(201).json({ voucher, expiresAt, session, transaction: tx });
   } catch (err) {
-    console.error('[WiFi Purchase Error]', err.message)
-    return res.status(500).json({ message: 'Purchase failed. Please try again.' })
+    res.status(500).json({ message: err.message });
   }
-})
+});
 
-// ── POST /api/wifi/activate (called by STK callback internally)
-async function activateWifiSession(purchaseId, trx) {
-  const purchase = await trx('wifi_purchases').where({ id: purchaseId }).first()
-  const offer    = await trx('wifi_offers').where({ id: purchase.offer_id }).first()
+// Get user's wifi sessions
+router.get('/sessions', auth, async (req, res) => {
+  try {
+    const sessions = await WifiSession.find({ user: req.user.id })
+      .populate('vendor', 'name location')
+      .sort({ createdAt: -1 });
+    res.json(sessions);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
 
-  const now    = new Date()
-  const expiry = new Date(now.getTime() + offer.duration_hours * 3600 * 1000)
-
-  await trx('wifi_purchases').where({ id: purchaseId }).update({
-    status:       'active',
-    activated_at: now,
-    expiry_time:  expiry,
-    updated_at:   now,
-  })
-
-  // Create session
-  const sessionId = uuid()
-  const username  = `np_${purchaseId.split('-')[0]}`
-  const password  = Math.random().toString(36).slice(2, 10)
-
-  await trx('wifi_sessions').insert({
-    id:          sessionId,
-    purchase_id: purchaseId,
-    user_id:     purchase.customer_id,
-    username,
-    password,
-    start_time:  now,
-    expiry_time: expiry,
-    status:      'active',
-    created_at:  now,
-    updated_at:  now,
-  })
-
-  // Credit merchant wallet
-  await trx('merchant_wallets')
-    .where({ merchant_id: purchase.merchant_id })
-    .increment('balance',        purchase.merchant_credit)
-    .increment('total_earnings', purchase.merchant_credit)
-
-  // Platform revenue
-  await trx('platform_revenue').insert({
-    id:          uuid(),
-    source:      'wifi_purchase_fee',
-    amount:      purchase.fee,
-    fee_rate:    FEE_RATE,
-    payer_id:    purchase.customer_id,
-    description: `WiFi fee — ${purchaseId}`,
-    created_at:  now,
-    updated_at:  now,
-  })
-
-  // Increment offer purchase count
-  await trx('wifi_offers').where({ id: purchase.offer_id }).increment('purchase_count', 1)
-
-  return { sessionId, username, password, expiry }
-}
-
-// ── GET /api/wifi/sessions ───────────────────────────────────────
-router.get('/sessions', authenticate, async (req, res) => {
-  const sessions = await db('wifi_sessions as s')
-    .join('wifi_purchases as p', 's.purchase_id', 'p.id')
-    .join('wifi_offers as o', 'p.offer_id', 'o.id')
-    .join('merchants as m', 'p.merchant_id', 'm.id')
-    .where('s.user_id', req.user.id)
-    .select('s.*', 'o.name as offer_name', 'o.speed_profile', 'm.business_name')
-    .orderBy('s.created_at', 'desc')
-    .limit(20)
-
-  return res.json({ sessions })
-})
-
-module.exports = { router, activateWifiSession }
+module.exports = router;
