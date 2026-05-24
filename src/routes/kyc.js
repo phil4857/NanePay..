@@ -1,90 +1,68 @@
 const router = require('express').Router();
-const auth = require('../middleware/auth');
-const mongoose = require('mongoose');
-const User = require('../models/User');
-const { sendSMS } = require('../services/sms');
+const db     = require('../db');
+const auth   = require('../middleware/auth');
+const { sendSMS }   = require('../services/sms');
 const { sendEmail } = require('../services/email');
 
-// KYC submission schema
-const kycSchema = new mongoose.Schema({
-  user:       { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, unique: true },
-  idType:     { type: String, enum: ['national_id', 'passport'], required: true },
-  idNumber:   { type: String, required: true },
-  idImageUrl: { type: String },
-  selfieUrl:  { type: String },
-  status:     { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
-  reviewNote: { type: String },
-  reviewedAt: { type: Date },
-}, { timestamps: true });
-
-const KYC = mongoose.models.KYC || mongoose.model('KYC', kycSchema);
-
-// Submit KYC
 router.post('/submit', auth, async (req, res) => {
   try {
-    const { idType, idNumber } = req.body;
-    if (!idType || !idNumber) return res.status(400).json({ message: 'ID type and number required' });
+    const { id_type, id_number } = req.body;
+    if (!id_type || !id_number)
+      return res.status(400).json({ message: 'ID type and number required' });
 
-    const existing = await KYC.findOne({ user: req.user.id });
-    if (existing && existing.status === 'approved')
-      return res.status(400).json({ message: 'KYC already approved' });
+    await db('kyc_submissions')
+      .insert({ user_id: req.user.id, id_type, id_number, status: 'pending' })
+      .onConflict('user_id').merge({ id_type, id_number, status: 'pending', updated_at: new Date() });
 
-    const kyc = await KYC.findOneAndUpdate(
-      { user: req.user.id },
-      { idType, idNumber, status: 'pending' },
-      { upsert: true, new: true }
+    await db('users').where({ id: req.user.id }).update({ kyc_status: 'pending' });
+
+    const user = await db('users').where({ id: req.user.id }).first();
+    await sendSMS(user.phone,
+      `NanePay: Your KYC documents have been submitted. We review within 24 hours and will notify you.`
     );
 
-    await User.findByIdAndUpdate(req.user.id, { kycStatus: 'pending' });
-
-    const user = await User.findById(req.user.id);
-    await sendSMS(user.phone, `NanePay: Your KYC documents have been submitted. We will review within 24 hours and notify you.`);
-    await sendEmail(user.email, 'KYC Submitted — NanePay',
-      `Hi ${user.name}, your KYC documents are under review. We will notify you within 24 hours.`);
-
-    res.status(201).json({ kyc, message: 'KYC submitted. You will be notified within 24 hours.' });
+    res.json({ message: 'KYC submitted. You will be notified within 24 hours.' });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// Get KYC status
 router.get('/status', auth, async (req, res) => {
   try {
-    const kyc = await KYC.findOne({ user: req.user.id }).select('-idNumber -idImageUrl');
-    const user = await User.findById(req.user.id).select('kycStatus');
-    res.json({ kycStatus: user.kycStatus, submission: kyc || null });
+    const user = await db('users').where({ id: req.user.id }).select('kyc_status').first();
+    const sub  = await db('kyc_submissions')
+      .where({ user_id: req.user.id })
+      .select('id_type','status','created_at','updated_at')
+      .first();
+    res.json({ kyc_status: user.kyc_status, submission: sub || null });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// Admin: approve or reject KYC
+// Admin: review KYC
 router.patch('/:userId/review', auth, async (req, res) => {
   try {
     const { status, note } = req.body;
-    if (!['approved', 'rejected'].includes(status))
+    if (!['approved','rejected'].includes(status))
       return res.status(400).json({ message: 'Status must be approved or rejected' });
 
-    const kyc = await KYC.findOneAndUpdate(
-      { user: req.params.userId },
-      { status, reviewNote: note, reviewedAt: new Date() },
-      { new: true }
-    );
-    if (!kyc) return res.status(404).json({ message: 'KYC submission not found' });
+    await db('kyc_submissions')
+      .where({ user_id: req.params.userId })
+      .update({ status, review_note: note, reviewed_at: new Date() });
 
-    await User.findByIdAndUpdate(req.params.userId, { kycStatus: status });
+    await db('users').where({ id: req.params.userId }).update({ kyc_status: status });
 
-    const user = await User.findById(req.params.userId);
+    const user = await db('users').where({ id: req.params.userId }).first();
     if (status === 'approved') {
-      await sendSMS(user.phone, `NanePay: Your KYC has been approved! You now have full access to all features and higher limits.`);
+      await sendSMS(user.phone, `NanePay: Your KYC is approved! You now have full access and higher limits.`);
       await sendEmail(user.email, 'KYC Approved — NanePay', `Congratulations ${user.name}! Your identity has been verified.`);
     } else {
-      await sendSMS(user.phone, `NanePay: Your KYC was not approved. Reason: ${note || 'Documents unclear'}. Please resubmit.`);
-      await sendEmail(user.email, 'KYC Update — NanePay', `Hi ${user.name}, your KYC was not approved. Reason: ${note}. Please resubmit.`);
+      await sendSMS(user.phone, `NanePay: KYC not approved. Reason: ${note || 'Documents unclear'}. Please resubmit.`);
+      await sendEmail(user.email, 'KYC Update — NanePay', `Hi ${user.name}, your KYC was not approved. Reason: ${note}. Please resubmit in the app.`);
     }
 
-    res.json(kyc);
+    res.json({ message: `KYC ${status} for user ${req.params.userId}` });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
