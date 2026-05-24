@@ -1,62 +1,63 @@
 const router = require('express').Router();
-const auth = require('../middleware/auth');
-const User = require('../models/User');
-const Transaction = require('../models/Transaction');
+const db     = require('../db');
+const auth   = require('../middleware/auth');
+const bcrypt = require('bcryptjs');
+const { calcFee, totalWithFee, generateRef } = require('../utils/helpers');
 const { sendSMS } = require('../services/sms');
-const { sendReceiptEmail } = require('../services/email');
 
-const FEE_RATE = parseFloat(process.env.PLATFORM_FEE_RATE || '0.01');
-const calcFee = (a) => Math.ceil(Number(a) * FEE_RATE * 100) / 100;
-
-// Static rates (replace with a live forex API like exchangerate-api.com in production)
 const RATES = [
-  { from: 'USD', to: 'KES', rate: 129.45, change: +0.23 },
-  { from: 'EUR', to: 'KES', rate: 141.10, change: -0.15 },
-  { from: 'GBP', to: 'KES', rate: 164.75, change: +0.45 },
-  { from: 'KES', to: 'USD', rate: 0.00773, change: -0.001 },
+  { from:'USD', to:'KES', rate:129.45, change:+0.23 },
+  { from:'EUR', to:'KES', rate:141.10, change:-0.15 },
+  { from:'GBP', to:'KES', rate:164.75, change:+0.45 },
+  { from:'KES', to:'USD', rate:0.00773,change:-0.001 },
 ];
 
-// Get current rates
 router.get('/rates', (req, res) => res.json(RATES));
 
-// Perform exchange
 router.post('/exchange', auth, async (req, res) => {
   try {
-    const { fromCurrency, toCurrency, amount, pin } = req.body;
-    if (!amount || amount < 1) return res.status(400).json({ message: 'Enter a valid amount' });
+    const { from_currency, to_currency, amount, pin } = req.body;
+    if (!amount || Number(amount) < 1)
+      return res.status(400).json({ message: 'Enter a valid amount' });
 
-    const user = await User.findById(req.user.id);
-    const pinOk = await user.comparePIN(pin);
+    const rateObj = RATES.find(r => r.from === from_currency && r.to === to_currency);
+    if (!rateObj) return res.status(400).json({ message: 'Unsupported currency pair' });
+
+    const user  = await db('users').where({ id: req.user.id }).first();
+    const pinOk = await bcrypt.compare(String(pin), user.pin_hash || '');
     if (!pinOk) return res.status(401).json({ message: 'Incorrect PIN' });
 
-    const rateObj = RATES.find(r => r.from === fromCurrency && r.to === toCurrency);
-    if (!rateObj) return res.status(400).json({ message: 'Exchange pair not supported' });
+    const amt       = Number(amount);
+    const fee       = calcFee(amt);
+    const converted = (amt * rateObj.rate).toFixed(4);
 
-    const f = calcFee(amount);
-    const totalDeduct = fromCurrency === 'KES' ? amount + f : amount;
-    if (user.balance < totalDeduct) return res.status(400).json({ message: 'Insufficient balance' });
+    if (from_currency === 'KES' && Number(user.balance) < totalWithFee(amt))
+      return res.status(400).json({ message: 'Insufficient balance (including 1% fee)' });
 
-    const converted = (amount * rateObj.rate).toFixed(4);
-
-    // Deduct source, credit if KES received
-    if (fromCurrency === 'KES') {
-      await User.findByIdAndUpdate(user._id, { $inc: { balance: -(amount + f) } });
-    } else {
-      await User.findByIdAndUpdate(user._id, { $inc: { balance: Number(converted) - f } });
-    }
-
-    const tx = await Transaction.create({
-      user: user._id, type: 'forex',
-      label: `${fromCurrency} → ${toCurrency}`,
-      amount: fromCurrency === 'KES' ? -amount : Number(converted),
-      fee: f, status: 'success',
-      metadata: { fromCurrency, toCurrency, rate: rateObj.rate, converted },
+    const ref = generateRef();
+    await db.transaction(async (trx) => {
+      if (from_currency === 'KES') {
+        await trx('users').where({ id: user.id }).decrement('balance', totalWithFee(amt));
+      } else {
+        await trx('users').where({ id: user.id }).increment('balance', Number(converted) - fee);
+      }
+      await trx('transactions').insert({
+        user_id:     user.id,
+        type:        'forex',
+        description: `${from_currency} → ${to_currency}`,
+        amount:      from_currency === 'KES' ? -amt : Number(converted),
+        fee,
+        status:      'success',
+        reference:   ref,
+        metadata:    JSON.stringify({ from_currency, to_currency, rate: rateObj.rate, converted }),
+      });
     });
 
-    await sendSMS(user.phone, `NanePay Forex: Exchanged ${fromCurrency} ${amount} → ${toCurrency} ${Number(converted).toFixed(2)}. Fee: KES ${f.toFixed(2)}. Ref: ${tx.ref}`);
-    await sendReceiptEmail(user, tx);
+    await sendSMS(user.phone,
+      `NanePay Forex: ${from_currency} ${amt} → ${to_currency} ${Number(converted).toFixed(2)}. Fee: KES ${fee.toFixed(2)}. Ref: ${ref}`
+    );
 
-    res.json({ transaction: tx, converted: Number(converted), fee: f });
+    res.json({ converted: Number(converted), fee, reference: ref });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
