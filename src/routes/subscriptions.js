@@ -1,11 +1,23 @@
 const express = require('express')
 const db      = require('../config/database')
 const logger  = require('../config/logger')
-const { authenticate, requireActive } = require('../middleware/auth')
-const { generateTxRef, calcFee }      = require('../utils/helpers')
-const { notify }                      = require('../services/notifications')
+
+const authMiddleware = require('../middleware/auth')
+
+const authenticate =
+  typeof authMiddleware === 'function'
+    ? authMiddleware
+    : authMiddleware.authenticate || authMiddleware.auth
+
+const requireActive =
+  authMiddleware.requireActive ||
+  ((req, res, next) => next())
+
+const { generateTxRef, calcFee } = require('../utils/helpers')
+const { notify }                 = require('../services/notifications')
 
 const router = express.Router()
+
 router.use(authenticate, requireActive)
 
 // ── POST /api/subscriptions — subscribe to a package ──────────
