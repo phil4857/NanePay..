@@ -1,52 +1,58 @@
 const router = require('express').Router();
-const auth = require('../middleware/auth');
-const Coupon = require('../models/Coupon');
+const db     = require('../db');
+const auth   = require('../middleware/auth');
+const crypto = require('crypto');
 
-// Get all coupons for logged-in user
-// NOTE: _internalPoints is excluded via { select: false } on the schema
-// It will NEVER appear in any response sent to the client
+// Safe fields returned to client — _internal_points is NEVER included
+const SAFE_FIELDS = ['id','code','source','used','used_at','created_at'];
+
 router.get('/', auth, async (req, res) => {
   try {
-    const coupons = await Coupon.find({ user: req.user.id }).sort({ createdAt: -1 });
-    // Map to safe client format — no internal fields exposed
-    res.json(coupons.map(c => c.toClientJSON()));
+    const coupons = await db('coupons')
+      .where({ user_id: req.user.id })
+      .select(SAFE_FIELDS)
+      .orderBy('created_at', 'desc');
+    res.json(coupons);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// Redeem a coupon
 router.post('/:id/redeem', auth, async (req, res) => {
   try {
-    const coupon = await Coupon.findOne({ _id: req.params.id, user: req.user.id });
-    if (!coupon) return res.status(404).json({ message: 'Coupon not found' });
-    if (coupon.used) return res.status(400).json({ message: 'Coupon already redeemed' });
+    const coupon = await db('coupons')
+      .where({ id: req.params.id, user_id: req.user.id })
+      .first();
+    if (!coupon)      return res.status(404).json({ message: 'Coupon not found' });
+    if (coupon.used)  return res.status(400).json({ message: 'Coupon already redeemed' });
 
-    coupon.used = true;
-    coupon.usedAt = new Date();
-    await coupon.save();
+    const [updated] = await db('coupons')
+      .where({ id: coupon.id })
+      .update({ used: true, used_at: new Date() })
+      .returning(SAFE_FIELDS);
 
-    // Internal: _internalPoints recorded for accounting but never returned to client
-    // You can use coupon._internalPoints here for your own revenue/analytics logic
-
-    res.json({ message: 'Coupon redeemed successfully', coupon: coupon.toClientJSON() });
+    // _internal_points used internally for analytics — never returned
+    res.json({ message: 'Coupon redeemed! Your exclusive reward has been applied.', coupon: updated });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// Admin: create a coupon for a user (internal use)
+// Internal: issue a coupon to a user (called by referral/birthday jobs)
 router.post('/issue', auth, async (req, res) => {
   try {
-    const { userId, code, source, internalPoints } = req.body;
-    const crypto = require('crypto');
-    const coupon = await Coupon.create({
-      user: userId || req.user.id,
-      code: code || 'NANE-' + crypto.randomBytes(4).toString('hex').toUpperCase(),
-      source: source || 'Manual Issue',
-      _internalPoints: internalPoints || 0,
-    });
-    res.status(201).json(coupon.toClientJSON());
+    const { user_id, source, internal_points } = req.body;
+    const code = 'NANE-' + crypto.randomBytes(4).toString('hex').toUpperCase();
+    const [coupon] = await db('coupons')
+      .insert({
+        user_id:          user_id || req.user.id,
+        code,
+        source:           source || 'Promotion',
+        used:             false,
+        _internal_points: internal_points || 0, // stored but never returned to client
+      })
+      .returning(SAFE_FIELDS);
+    res.status(201).json(coupon);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
