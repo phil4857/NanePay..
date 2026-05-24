@@ -1,28 +1,39 @@
 const router = require('express').Router();
-const auth = require('../middleware/auth');
-const Transaction = require('../models/Transaction');
+const db     = require('../db');
+const auth   = require('../middleware/auth');
 
-// Get all transactions for logged-in user
+// Get paginated transactions for logged-in user
 router.get('/', auth, async (req, res) => {
   try {
     const { page = 1, limit = 20, type } = req.query;
-    const filter = { user: req.user.id };
-    if (type) filter.type = type;
-    const txs = await Transaction.find(filter)
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(Number(limit));
-    const total = await Transaction.countDocuments(filter);
-    res.json({ transactions: txs, total, page: Number(page), pages: Math.ceil(total / limit) });
+    const offset = (Number(page) - 1) * Number(limit);
+
+    let query = db('transactions').where({ user_id: req.user.id });
+    if (type) query = query.andWhere({ type });
+
+    const [{ count }] = await query.clone().count('id as count');
+    const txs = await query
+      .orderBy('created_at', 'desc')
+      .limit(Number(limit))
+      .offset(offset);
+
+    res.json({
+      transactions: txs,
+      total:  Number(count),
+      page:   Number(page),
+      pages:  Math.ceil(Number(count) / Number(limit)),
+    });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// Get single transaction by ref
+// Get single transaction by reference
 router.get('/:ref', auth, async (req, res) => {
   try {
-    const tx = await Transaction.findOne({ ref: req.params.ref, user: req.user.id });
+    const tx = await db('transactions')
+      .where({ reference: req.params.ref, user_id: req.user.id })
+      .first();
     if (!tx) return res.status(404).json({ message: 'Transaction not found' });
     res.json(tx);
   } catch (err) {
