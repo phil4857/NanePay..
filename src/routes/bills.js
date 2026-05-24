@@ -3,8 +3,14 @@ const express  = require('express')
 const { v4: uuid } = require('uuid')
 const db       = require('../db')
 const logger   = require('../config/logger')
-const { authenticate } = require('../middleware/auth')
+const authMiddleware = require('../middleware/auth')
 
+const authenticate =
+  typeof authMiddleware === 'function'
+    ? authMiddleware
+    : authMiddleware.authenticate ||
+      authMiddleware.auth ||
+      authMiddleware.default 
 const router = express.Router()
 
 // ── SUPPORTED BILLERS ─────────────────────────────────────────
