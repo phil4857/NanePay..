@@ -1,60 +1,64 @@
-require('dotenv').config()
-const express = require('express')
-const helmet  = require('helmet')
-const cors    = require('cors')
-const morgan  = require('morgan')
-const logger  = require('./config/logger')
-const { apiLimiter } = require('./middleware/rateLimit')
+require('dotenv').config();
+const express = require('express');
+const cors    = require('cors');
+const helmet  = require('helmet');
+const morgan  = require('morgan');
 
-const app = express()
+const app = express();
 
-app.set('trust proxy', 1)
-app.use(helmet())
+// ── Middleware ────────────────────────────────────────────────────────────────
+app.use(helmet());
 app.use(cors({
-  origin: [
-    'https://nane-pay-avya.vercel.app',
-    process.env.FRONTEND_URL,
-    'http://localhost:3000',
-  ],
+  origin: process.env.FRONTEND_URL || '*',
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-}))
-app.use(express.json({ limit: '10kb' }))
-app.use(express.urlencoded({ extended: true }))
-app.use(morgan('combined', { stream: { write: (msg) => logger.info(msg.trim()) } }))
-app.use('/api', apiLimiter)
+}));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(morgan('dev'));
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'NanePay API', version: '2.0.0', time: new Date().toISOString() })
-})
+// ── Routes ────────────────────────────────────────────────────────────────────
+app.use('/api/auth',          require('./routes/auth'));
+app.use('/api/wallet',        require('./routes/wallet'));
+app.use('/api/transactions',  require('./routes/transactions'));
+app.use('/api/invest',        require('./routes/invest'));
+app.use('/api/forex',         require('./routes/forex'));
+app.use('/api/wifi',          require('./routes/wifi'));
+app.use('/api/hotspot',       require('./routes/hotspot'));
+app.use('/api/merchant',      require('./routes/merchant'));
+app.use('/api/coupon',        require('./routes/coupon'));
+app.use('/api/referrals',     require('./routes/referrals'));
+app.use('/api/kyc',           require('./routes/kyc'));
+app.use('/api/notifications', require('./routes/notifications'));
+app.use('/api/bills',         require('./routes/bills'));
+app.use('/api/subscriptions', require('./routes/subscriptions'));
+app.use('/api/withdrawal',    require('./routes/withdrawal'));
+app.use('/api/request',       require('./routes/request'));
+app.use('/api/qr',            require('./routes/qr'));
+app.use('/api/packages',      require('./routes/packages'));
+app.use('/api/passwords',     require('./routes/passwords'));
+app.use('/api/mikrotik',      require('./routes/mikrotik'));
+app.use('/api/admin',         require('./routes/admin'));
 
-// ── ROUTES ────────────────────────────────────────────────────
-app.use('/api/auth',          require('./routes/auth'))
-app.use('/api/auth',          require('./routes/passwords'))
-app.use('/api/wallet',        require('./routes/wallet'))
-app.use('/api/transactions',  require('./routes/transactions'))
-app.use('/api/mpesa',         require('./routes/mpesa'))
-app.use('/api/forex',         require('./routes/forex'))
-app.use('/api/invest',        require('./routes/invest'))
-app.use('/api/merchant',      require('./routes/merchant'))
-app.use('/api/bills',         require('./routes/bills'))
-app.use('/api/packages',      require('./routes/packages'))
-app.use('/api/subscriptions', require('./routes/subscriptions'))
-app.use('/api/mikrotik',      require('./routes/mikrotik'))
-app.use('/api/notifications', require('./routes/notifications'))
-app.use('/api/qr',            require('./routes/qr'))
-app.use('/api/request',       require('./routes/request'))
-app.use('/api/admin',         require('./routes/admin'))
+// ── Health check ──────────────────────────────────────────────────────────────
+app.get('/health', (req, res) =>
+  res.json({ status: 'ok', service: 'NanePay API', timestamp: new Date() })
+);
 
-app.use((req, res) => res.status(404).json({ error: `Route ${req.method} ${req.path} not found` }))
+// ── 404 ───────────────────────────────────────────────────────────────────────
+app.use((req, res) =>
+  res.status(404).json({ message: `Route ${req.method} ${req.path} not found` })
+);
+
+// ── Global error handler ──────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
-  logger.error('Unhandled error', { err: err.message, path: req.path })
-  res.status(500).json({ error: 'Something went wrong. Please try again.' })
-})
+  console.error('[ERROR]', err.stack || err.message);
+  res.status(err.status || 500).json({ message: err.message || 'Internal server error' });
+});
 
-const PORT = process.env.PORT || 5000
+const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  logger.info(`🚀 NanePay API v2.0 running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`)
-})
+  console.log(`\n🚀 NanePay API running on port ${PORT}`);
+  console.log(`   Health: http://localhost:${PORT}/health\n`);
+});
 
-module.exports = app
+module.exports = app;
