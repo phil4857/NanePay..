@@ -17,27 +17,46 @@ app.use(express.urlencoded({ extended: true }));
 app.use(morgan('dev'));
 
 // ── Routes ────────────────────────────────────────────────────────────────────
-app.use('/api/auth',          require('./routes/auth'));
-app.use('/api/wallet',        require('./routes/wallet'));
-app.use('/api/transactions',  require('./routes/transactions'));
-app.use('/api/invest',        require('./routes/invest'));
-app.use('/api/forex',         require('./routes/forex'));
-app.use('/api/wifi',          require('./routes/wifi'));
-app.use('/api/hotspot',       require('./routes/hotspot'));
-app.use('/api/merchant',      require('./routes/merchant'));
-app.use('/api/coupon',        require('./routes/coupon'));
-app.use('/api/referrals',     require('./routes/referrals'));
-app.use('/api/kyc',           require('./routes/kyc'));
-app.use('/api/notifications', require('./routes/notifications'));
-app.use('/api/bills',         require('./routes/bills'));
-app.use('/api/subscriptions', require('./routes/subscriptions'));
-app.use('/api/withdrawal',    require('./routes/withdrawal'));
-app.use('/api/request',       require('./routes/request'));
-app.use('/api/qr',            require('./routes/qr'));
-app.use('/api/packages',      require('./routes/packages'));
-app.use('/api/passwords',     require('./routes/passwords'));
-app.use('/api/mikrotik',      require('./routes/mikrotik'));
-app.use('/api/admin',         require('./routes/admin'));
+const loadRoute = (path, name) => {
+  try {
+    const route = require(path)
+
+    if (!route || typeof route !== 'function') {
+      console.error(`❌ Route "${name}" is invalid`)
+      console.log(route)
+      process.exit(1)
+    }
+
+    console.log(`✅ Loaded route: ${name}`)
+    return route
+  } catch (err) {
+    console.error(`❌ Failed loading route: ${name}`)
+    console.error(err)
+    process.exit(1)
+  }
+}
+
+app.use('/api/auth',          loadRoute('./routes/auth', 'auth'))
+app.use('/api/wallet',        loadRoute('./routes/wallet', 'wallet'))
+app.use('/api/transactions',  loadRoute('./routes/transactions', 'transactions'))
+app.use('/api/invest',        loadRoute('./routes/invest', 'invest'))
+app.use('/api/forex',         loadRoute('./routes/forex', 'forex'))
+app.use('/api/wifi',          loadRoute('./routes/wifi', 'wifi'))
+app.use('/api/hotspot',       loadRoute('./routes/hotspot', 'hotspot'))
+app.use('/api/merchant',      loadRoute('./routes/merchant', 'merchant'))
+app.use('/api/coupon',        loadRoute('./routes/coupon', 'coupon'))
+app.use('/api/referrals',     loadRoute('./routes/referrals', 'referrals'))
+app.use('/api/kyc',           loadRoute('./routes/kyc', 'kyc'))
+app.use('/api/notifications', loadRoute('./routes/notifications', 'notifications'))
+app.use('/api/bills',         loadRoute('./routes/bills', 'bills'))
+app.use('/api/subscriptions', loadRoute('./routes/subscriptions', 'subscriptions'))
+app.use('/api/withdrawal',    loadRoute('./routes/withdrawal', 'withdrawal'))
+app.use('/api/request',       loadRoute('./routes/request', 'request'))
+app.use('/api/qr',            loadRoute('./routes/qr', 'qr'))
+app.use('/api/packages',      loadRoute('./routes/packages', 'packages'))
+app.use('/api/passwords',     loadRoute('./routes/passwords', 'passwords'))
+app.use('/api/mikrotik',      loadRoute('./routes/mikrotik', 'mikrotik'))
+app.use('/api/admin',         loadRoute('./routes/admin', 'admin'))
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/health', (req, res) =>
