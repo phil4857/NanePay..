@@ -1,3 +1,7 @@
+const express = require('express')
+const db      = require('../config/database')
+const logger  = require('../config/logger')
+
 const authMiddleware = require('../middleware/auth')
 
 const authenticate =
@@ -5,7 +9,16 @@ const authenticate =
     ? authMiddleware
     : authMiddleware.authenticate || authMiddleware.auth
 
+const requireActive =
+  authMiddleware.requireActive ||
+  ((req, res, next) => next())
+
+const { generateTxRef, calcFee } = require('../utils/helpers')
+const { notify }                 = require('../services/notifications')
+
 const router = express.Router()
+
+router.use(authenticate, requireActive)
 
 // ── GET /api/packages ─────────────────────────────────────────
 // Public — list all active packages
