@@ -1,9 +1,9 @@
-// src/routes/packages.js  ← REPLACEMENT
-const express      = require('express')
-const { v4: uuid } = require('uuid')
-const db           = require('../db')
-const logger       = require('../config/logger')
-const { authenticate, requireRole } = require('../middleware')
+const authMiddleware = require('../middleware/auth')
+
+const authenticate =
+  typeof authMiddleware === 'function'
+    ? authMiddleware
+    : authMiddleware.authenticate || authMiddleware.auth
 
 const router = express.Router()
 
