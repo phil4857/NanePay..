@@ -1,9 +1,23 @@
 const express = require('express')
 const db      = require('../config/database')
-const { authenticate, requireActive } = require('../middleware/auth')
-const { v4: uuidv4 }                  = require('uuid')
+const logger  = require('../config/logger')
+
+const authMiddleware = require('../middleware/auth')
+
+const authenticate =
+  typeof authMiddleware === 'function'
+    ? authMiddleware
+    : authMiddleware.authenticate || authMiddleware.auth
+
+const requireActive =
+  authMiddleware.requireActive ||
+  ((req, res, next) => next())
+
+const { normalizePhone } = require('../utils/helpers')
+const { notify }         = require('../services/notifications')
 
 const router = express.Router()
+
 router.use(authenticate, requireActive)
 
 // ── POST /api/qr/generate — generate QR payment link ──────────
